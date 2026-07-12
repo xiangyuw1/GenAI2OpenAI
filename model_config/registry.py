@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from model_config.spec import ModelSpec
+
+logger = logging.getLogger(__name__)
 
 MODEL_SPECS: dict[str, ModelSpec] = {
     "glm-5.1": ModelSpec(
@@ -125,7 +128,35 @@ def resolve_model(model_id: str | None) -> ModelSpec | None:
 
 def get_genai_id(model_id: str) -> str:
     spec = resolve_model(model_id)
-    return spec.genai_id if spec else model_id
+    if spec:
+        return spec.genai_id
+    
+    # 尝试从 model_registry 中进行大小写不敏感的查找
+    # 这处理动态模型（如 GPT-5.6-SOL）的大小写变体
+    try:
+        from config import model_registry
+        # 尝试获取模型，如果未加载则触发加载
+        models = model_registry._models
+        if not models:
+            # 尝试从 Flask context 获取 token 来加载模型
+            try:
+                from flask import g
+                token = getattr(g, 'token', None)
+                if token:
+                    models = model_registry.get_models(token)
+            except Exception:
+                pass
+        
+        if models:
+            model_id_lower = model_id.lower()
+            for ai_type, info in models.items():
+                if ai_type.lower() == model_id_lower:
+                    logger.debug("Case-insensitive match: %s -> %s", model_id, ai_type)
+                    return ai_type
+    except Exception:
+        pass
+    
+    return model_id
 
 
 def get_root_ai_type(model_id: str, genai_record: dict | None = None) -> str:

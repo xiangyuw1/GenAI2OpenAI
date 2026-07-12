@@ -68,8 +68,8 @@ config = Config(
 app = create_app(config)
 
 if __name__ == '__main__':
-    logger.info("Starting GenAI2OpenAI proxy on port %d", config.port)
+    logger.info("Starting GenAI2OpenAI proxy on 127.0.0.1:%d", config.port)
     logger.info("Debug: %s, Auth: %s, Token mode: %s",
                 config.debug, "enabled" if config.api_key else "disabled",
                 token_manager.mode)
-    app.run(host='0.0.0.0', port=config.port, debug=False)
+    app.run(host='127.0.0.1', port=config.port, debug=False)
