@@ -218,3 +218,5 @@ opencode.json
 bench/results/
 
 .DS_Store
+
+.mimocode
