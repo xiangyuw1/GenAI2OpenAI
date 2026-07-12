@@ -426,7 +426,9 @@ def stream_genai_response(chat_info, messages, model, max_tokens, config):
     genai_id = get_genai_id(model)
     record = None
     if not resolve_model(model):
-        record = model_registry.get_models(token).get(model)
+        model_info = model_registry.get_models(token).get(model)
+        if model_info:
+            record = {"rootAiType": model_info.root_ai_type}
     root_ai_type = get_root_ai_type(model, genai_record=record)
 
     has_image_content = any(
