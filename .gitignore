@@ -201,6 +201,11 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local research artifacts
+/temp
+/AGENTS.md
+.genai_token_cache
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
@@ -211,3 +216,5 @@ opencode.json
 
 # Benchmark outputs
 bench/results/
+
+.DS_Store
