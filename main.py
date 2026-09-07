@@ -1473,8 +1473,94 @@ def build_response_input_messages(input_value):
     return []
 
 
+def build_responses_output_items(content, reasoning_content, message_id, reasoning_id):
+    """构造 Responses API 的 `output` 数组。
+
+    Args:
+        content (str): 模型正文。
+        reasoning_content (str): 模型思维链内容，可为空。
+        message_id (str): message item 的 id。
+        reasoning_id (str): reasoning item 的 id。
+
+    Returns:
+        list[dict]: 符合 Responses API schema 的 output item 列表。
+    """
+    output = []
+    if reasoning_content:
+        output.append({
+            "id": reasoning_id,
+            "type": "reasoning",
+            "summary": [
+                {
+                    "type": "summary_text",
+                    "text": reasoning_content,
+                }
+            ],
+        })
+    output.append({
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+            {
+                "type": "output_text",
+                "text": content,
+                "annotations": [],
+            }
+        ],
+    })
+    return output
+
+
+def build_responses_object(response_id, model, created, status, output, max_output_tokens=None):
+    """构造 Responses API 的顶层 response 对象。
+
+    OpenAI 官方 SDK 会按 schema 校验该对象，`parallel_tool_calls` / `tool_choice` /
+    `tools` 等字段即便为空也必须存在，否则严格客户端会解析失败并可能不断重试。
+
+    Args:
+        response_id (str): 响应 id。
+        model (str): 调用方传入的模型名。
+        created (int): 创建时间戳（秒）。
+        status (str): `in_progress` / `completed` / `failed` 之一。
+        output (list[dict]): output item 列表。
+        max_output_tokens (int | None): 最大输出 token 数。
+
+    Returns:
+        dict: 可直接序列化的 response 对象。
+    """
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": created,
+        "status": status,
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": False,
+        "tool_choice": "none",
+        "tools": [],
+        "temperature": None,
+        "top_p": None,
+        "max_output_tokens": max_output_tokens,
+        "previous_response_id": None,
+        "reasoning": None,
+        "metadata": {},
+        "error": None,
+        "incomplete_details": None,
+        "instructions": None,
+        "usage": None,
+    }
+
+
 def stream_responses_api(messages, model, max_tokens, access_token=None):
-    """将内部事件流转换为最小 Responses API SSE。
+    """将内部事件流转换为 Responses API SSE。
+
+    必须输出完整的事件生命周期（output_item.added -> content_part.added ->
+    output_text.delta -> output_text.done -> content_part.done ->
+    output_item.done -> response.completed），且每个事件都要带上 schema 要求的
+    必填字段与递增的 `sequence_number`。缺字段会导致 OpenAI SDK 丢弃事件，
+    客户端因收不到正文而一直等待并重发请求。
 
     Args:
         messages (list[dict]): 发送给上游的消息列表。
@@ -1483,77 +1569,220 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
         access_token (str | None): 请求级 GenAI token，未提供时使用启动参数。
 
     Yields:
-        str: 符合最小 Responses API SSE 格式的文本片段。
+        str: 符合 Responses API SSE 格式的文本片段。
     """
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(datetime.now().timestamp())
     reasoning_id = f"rs_{uuid.uuid4().hex[:12]}"
-    output_index = 0
+    message_id = f"msg_{uuid.uuid4().hex[:12]}"
 
-    created_event = {
+    sequence = 0
+
+    def emit(payload):
+        """补齐 sequence_number 并序列化为一条 SSE 数据行。"""
+        nonlocal sequence
+        payload["sequence_number"] = sequence
+        sequence += 1
+        return f"data: {json.dumps(payload)}\n\n"
+
+    yield emit({
         "type": "response.created",
-        "response": {
-            "id": response_id,
-            "object": "response",
-            "created_at": created,
-            "status": "in_progress",
-            "model": model,
-        }
-    }
-    yield f"data: {json.dumps(created_event)}\n\n"
+        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens),
+    })
+    yield emit({
+        "type": "response.in_progress",
+        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens),
+    })
+
+    # reasoning 与 message 是两个独立的 output item，按需惰性开启。
+    reasoning_index = None
+    message_index = None
+    next_output_index = 0
+    reasoning_parts = []
+    content_parts = []
 
     for event in stream_genai_events(messages, model, max_tokens, access_token):
         if event["type"] == "error":
-            error_event = {
-                "type": "response.failed",
-                "response": {
-                    "id": response_id,
-                    "object": "response",
-                    "created_at": created,
-                    "status": "failed",
-                    "model": model,
-                },
-                "error": {
-                    "message": event["error"],
-                }
-            }
-            yield f"data: {json.dumps(error_event)}\n\n"
+            failed_response = build_responses_object(response_id, model, created, "failed", [], max_tokens)
+            failed_response["error"] = {"code": "upstream_error", "message": event["error"]}
+            yield emit({"type": "response.failed", "response": failed_response})
             yield "data: [DONE]\n\n"
             return
 
         if event["type"] == "delta":
-            # Responses 接口将 reasoning 和正文拆成不同事件类型。
-            if event.get("reasoning") is not None:
-                reasoning_event = {
-                    "type": "response.reasoning.delta",
-                    "response_id": response_id,
-                    "output_index": output_index,
+            reasoning = event.get("reasoning")
+            if reasoning:
+                if reasoning_index is None:
+                    reasoning_index = next_output_index
+                    next_output_index += 1
+                    yield emit({
+                        "type": "response.output_item.added",
+                        "output_index": reasoning_index,
+                        "item": {"id": reasoning_id, "type": "reasoning", "summary": []},
+                    })
+                    yield emit({
+                        "type": "response.reasoning_summary_part.added",
+                        "item_id": reasoning_id,
+                        "output_index": reasoning_index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    })
+                reasoning_parts.append(reasoning)
+                yield emit({
+                    "type": "response.reasoning_summary_text.delta",
                     "item_id": reasoning_id,
-                    "delta": event["reasoning"],
-                }
-                yield f"data: {json.dumps(reasoning_event)}\n\n"
+                    "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "delta": reasoning,
+                })
 
-            if event.get("content") is not None:
-                content_event = {
+            content = event.get("content")
+            if content:
+                # 正文开始前先收尾 reasoning item，保证 item 不交错。
+                if reasoning_index is not None and message_index is None:
+                    reasoning_text = "".join(reasoning_parts)
+                    yield emit({
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": reasoning_id,
+                        "output_index": reasoning_index,
+                        "summary_index": 0,
+                        "text": reasoning_text,
+                    })
+                    yield emit({
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": reasoning_id,
+                        "output_index": reasoning_index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": reasoning_text},
+                    })
+                    yield emit({
+                        "type": "response.output_item.done",
+                        "output_index": reasoning_index,
+                        "item": {
+                            "id": reasoning_id,
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": reasoning_text}],
+                        },
+                    })
+
+                if message_index is None:
+                    message_index = next_output_index
+                    next_output_index += 1
+                    yield emit({
+                        "type": "response.output_item.added",
+                        "output_index": message_index,
+                        "item": {
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
+                    })
+                    yield emit({
+                        "type": "response.content_part.added",
+                        "item_id": message_id,
+                        "output_index": message_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []},
+                    })
+
+                content_parts.append(content)
+                yield emit({
                     "type": "response.output_text.delta",
-                    "response_id": response_id,
-                    "output_index": output_index,
-                    "delta": event["content"],
-                }
-                yield f"data: {json.dumps(content_event)}\n\n"
+                    "item_id": message_id,
+                    "output_index": message_index,
+                    "content_index": 0,
+                    "delta": content,
+                    "logprobs": [],
+                })
 
         if event["type"] == "done":
-            completed_event = {
-                "type": "response.completed",
-                "response": {
-                    "id": response_id,
-                    "object": "response",
-                    "created_at": created,
+            reasoning_text = "".join(reasoning_parts)
+            final_text = "".join(content_parts)
+
+            # 上游只给了 reasoning 而没有正文时，也要正常收尾 reasoning item。
+            if reasoning_index is not None and message_index is None:
+                yield emit({
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "text": reasoning_text,
+                })
+                yield emit({
+                    "type": "response.reasoning_summary_part.done",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": reasoning_text},
+                })
+                yield emit({
+                    "type": "response.output_item.done",
+                    "output_index": reasoning_index,
+                    "item": {
+                        "id": reasoning_id,
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": reasoning_text}],
+                    },
+                })
+
+            # 即使上游没有产出任何正文，也必须补一个空 message item，
+            # 否则客户端拿不到 assistant 消息会认为响应无效。
+            if message_index is None:
+                message_index = next_output_index
+                next_output_index += 1
+                yield emit({
+                    "type": "response.output_item.added",
+                    "output_index": message_index,
+                    "item": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "in_progress",
+                        "content": [],
+                    },
+                })
+                yield emit({
+                    "type": "response.content_part.added",
+                    "item_id": message_id,
+                    "output_index": message_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                })
+
+            yield emit({
+                "type": "response.output_text.done",
+                "item_id": message_id,
+                "output_index": message_index,
+                "content_index": 0,
+                "text": final_text,
+                "logprobs": [],
+            })
+            yield emit({
+                "type": "response.content_part.done",
+                "item_id": message_id,
+                "output_index": message_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": final_text, "annotations": []},
+            })
+            yield emit({
+                "type": "response.output_item.done",
+                "output_index": message_index,
+                "item": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
                     "status": "completed",
-                    "model": model,
-                }
-            }
-            yield f"data: {json.dumps(completed_event)}\n\n"
+                    "content": [{"type": "output_text", "text": final_text, "annotations": []}],
+                },
+            })
+
+            output = build_responses_output_items(final_text, reasoning_text, message_id, reasoning_id)
+            yield emit({
+                "type": "response.completed",
+                "response": build_responses_object(response_id, model, created, "completed", output, max_tokens),
+            })
             yield "data: [DONE]\n\n"
             return
 
@@ -1695,39 +1924,23 @@ def responses():
         # 非流式返回时，将 reasoning 和 message 组装到 output 数组中。
         collected = collect_genai_response(messages, model, max_output_tokens, access_token)
         response_id = f"resp_{uuid.uuid4().hex}"
-        output = []
-        if collected["reasoning_content"]:
-            output.append({
-                "id": f"rs_{uuid.uuid4().hex[:12]}",
-                "type": "reasoning",
-                "summary": [
-                    {
-                        "type": "summary_text",
-                        "text": collected["reasoning_content"],
-                    }
-                ]
-            })
-        output.append({
-            "id": f"msg_{uuid.uuid4().hex[:12]}",
-            "type": "message",
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "output_text",
-                    "text": collected["content"],
-                }
-            ]
-        })
+        output = build_responses_output_items(
+            collected["content"],
+            collected["reasoning_content"],
+            f"msg_{uuid.uuid4().hex[:12]}",
+            f"rs_{uuid.uuid4().hex[:12]}",
+        )
 
-        return jsonify({
-            "id": response_id,
-            "object": "response",
-            "created_at": int(datetime.now().timestamp()),
-            "status": "completed",
-            "model": model,
-            "output": output,
-            "output_text": collected["content"],
-        })
+        response_object = build_responses_object(
+            response_id,
+            model,
+            int(datetime.now().timestamp()),
+            "completed",
+            output,
+            max_output_tokens,
+        )
+        response_object["output_text"] = collected["content"]
+        return jsonify(response_object)
 
     except Exception as e:
         logger.exception("responses failed")
