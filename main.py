@@ -1635,7 +1635,15 @@ def build_responses_object(response_id, model, created, status, output, max_outp
         "error": None,
         "incomplete_details": None,
         "instructions": None,
-        "usage": None,
+        # 上游不返回 token 统计，但部分客户端会读取 usage 判断本轮是否真的
+        # 产出内容，缺失时可能误判为空轮次并重复请求。
+        "usage": {
+            "input_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens": 0,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 0,
+        },
     }
 
 
