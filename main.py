@@ -33,6 +33,12 @@ parser.add_argument('--upload-token', type=str, default='2ea38f293adb4abca21132f
                     help='GenAI image upload API token header value')
 parser.add_argument('--port', type=int, default=5000,
                     help='Flask server port (default: 5000)')
+parser.add_argument('--upstream-connect-timeout', type=float, default=10.0,
+                    help='Upstream TCP connect timeout in seconds (default: 10)')
+parser.add_argument('--upstream-read-timeout', type=float, default=300.0,
+                    help='Upstream inter-chunk read timeout in seconds. Reasoning models such as '
+                         'gpt-6-astra / GPT-5.6-* buffer server-side and can stay silent for 60-90s '
+                         'before the first token (default: 300)')
 parser.add_argument('--log-level', type=str, default='INFO',
                     choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                     help='Console log level (default: INFO)')
@@ -49,6 +55,12 @@ logger = logging.getLogger('genai-proxy')
 
 BASE_DIR = os.path.dirname(__file__)
 TOKEN_CACHE_PATH = os.path.join(BASE_DIR, ".genai_token_cache")
+
+# 上游超时统一使用 (连接超时, 读取超时) 二元组。读取超时是 *相邻数据块* 之间的
+# 间隔上限，而非整个请求的总时长，因此长回答只要持续有数据就不会被截断。
+# 推理型模型（gpt-6-astra、GPT-5.6-* 等）会在服务端完成思考后才吐第一个字节，
+# 实测首字节延迟可达 75s 以上，故默认读取超时放宽到 300s。
+UPSTREAM_TIMEOUT = (args.upstream_connect_timeout, args.upstream_read_timeout)
 
 
 def load_cached_token():
@@ -90,16 +102,16 @@ def build_startup_genai_headers(token):
 
 
 def validate_cached_token(token):
-    """用 deepseek-v3 发起最小对话，返回非空内容则认为 token 有效。"""
+    """用 deepseek-chat 发起最小对话，返回非空内容则认为 token 有效。"""
     if not token:
         return False
 
     payload = {
         "chatInfo": "你好",
-        "messages": [{"role": "user", "content": "你好"}],
+        "messages": [],
         "type": "3",
         "stream": True,
-        "aiType": "deepseek-v3:671b",
+        "aiType": "deepseek-chat",
         "aiSecType": "1",
         "promptTokens": 0,
         "rootAiType": "xinference",
@@ -165,7 +177,7 @@ def auto_login_with_account(account):
 if not args.token:
     cached_token = load_cached_token()
     if cached_token:
-        logger.info("Found cached token, validating with deepseek-v3")
+        logger.info("Found cached token, validating with deepseek-chat")
         if validate_cached_token(cached_token):
             args.token = cached_token
             logger.info("Cached token is valid")
@@ -202,34 +214,50 @@ GENAI_HEADERS = {
 
 MODEL_SPECS = [
     {
-        "public_id": "deepseek-r1",
-        "request_id": "deepseek-r1:671b",
-        "actual_id": "deepseek-r1:671b",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "deepseek-v3",
-        "request_id": "deepseek-v3:671b",
-        "actual_id": "deepseek-v3:671b",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "glm-5.1",
+        "public_id": "glm-5.3-flash",
         "request_id": "chatglm",
         "actual_id": "glm-chat",
         "root_ai_type": "xinference",
+        # 上游把 chatglm 底层模型换成了 GLM-5.3-Flash，保留旧名避免调用方改造。
+        "legacy_ids": ["glm-5.1"],
     },
     {
-        "public_id": "minimax-m1",
-        "request_id": "MiniMax-M1",
-        "actual_id": "minimax",
-        "root_ai_type": "xinference",
-    },
-    {
-        "public_id": "qwen3.5-397b-a17b",
+        "public_id": "qwen-3.8",
         "request_id": "qwen-instruct",
         "actual_id": "qwen-instruct",
         "root_ai_type": "xinference",
+        # 上游把 qwen-instruct 底层模型换成了 Qwen-3.8，保留旧名避免调用方改造。
+        "legacy_ids": ["qwen3.5-397b-a17b"],
+    },
+    {
+        "public_id": "kimi-k3",
+        "request_id": "Kimi-k3",
+        "actual_id": "Kimi-k3",
+        "root_ai_type": "xinference",
+    },
+    {
+        "public_id": "gpt-6-astra",
+        "request_id": "gpt-6-astra",
+        "actual_id": "gpt-6-astra",
+        "root_ai_type": "azure",
+    },
+    {
+        "public_id": "gpt-5.6-sol",
+        "request_id": "GPT-5.6-SOL",
+        "actual_id": "GPT-5.6-SOL",
+        "root_ai_type": "azure",
+    },
+    {
+        "public_id": "gpt-5.6-terra",
+        "request_id": "GPT-5.6-Terra",
+        "actual_id": "GPT-5.6-Terra",
+        "root_ai_type": "azure",
+    },
+    {
+        "public_id": "gpt-5.6-luna",
+        "request_id": "GPT-5.6-Luna",
+        "actual_id": "GPT-5.6-Luna",
+        "root_ai_type": "azure",
     },
     {
         "public_id": "gpt-5.5",
@@ -250,27 +278,9 @@ MODEL_SPECS = [
         "root_ai_type": "azure",
     },
     {
-        "public_id": "gpt-5",
-        "request_id": "GPT-5",
-        "actual_id": "gpt-5-2025-08-07",
-        "root_ai_type": "azure",
-    },
-    {
         "public_id": "gpt-4.1",
         "request_id": "GPT-4.1",
         "actual_id": "gpt-4.1-2025-04-14",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-4.1-mini",
-        "request_id": "GPT-4.1-mini",
-        "actual_id": "gpt-4.1-mini-2025-04-14",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-o4-mini",
-        "request_id": "o4-mini",
-        "actual_id": "o4-mini-2025-04-16",
         "root_ai_type": "azure",
     },
     {
@@ -293,24 +303,61 @@ MODEL_SPECS = [
     },
 ]
 
+# 上游已下线的模型别名，保留用于给出明确的下线提示而非直接透传。
+# 复活时把对应条目移回 MODEL_SPECS 即可。
+RETIRED_MODEL_ALIASES = {
+    "deepseek-r1": "deepseek-r1:671b",
+    "deepseek-r1:671b": "deepseek-r1:671b",
+    "deepseek-v3": "deepseek-v3:671b",
+    "deepseek-v3:671b": "deepseek-v3:671b",
+    "minimax-m1": "MiniMax-M1",
+    "minimax": "MiniMax-M1",
+    "gpt-5": "GPT-5",
+    "gpt-5-2025-08-07": "GPT-5",
+    "gpt-4.1-mini": "GPT-4.1-mini",
+    "gpt-4.1-mini-2025-04-14": "GPT-4.1-mini",
+    "gpt-o4-mini": "o4-mini",
+    "o4-mini": "o4-mini",
+    "o4-mini-2025-04-16": "o4-mini",
+    # 图片模型在对话端点不可用（GPT-Image-2 返回 400，gpt-image-1.5 无可用节点）。
+    "gpt-image-2": "GPT-Image-2",
+    "gpt-image-1.5": "gpt-image-1.5",
+}
+
 
 def build_model_alias_lookup():
     """构建模型别名查找表。
 
-    将对外公开名称、上游请求名称和上游实际模型名称统一映射到同一份
-    模型规格上，便于后续按任意别名解析。
+    将对外公开名称、上游请求名称、上游实际模型名称以及历史兼容名称统一
+    映射到同一份模型规格上，便于后续按任意别名解析。
 
     Returns:
         dict[str, dict]: 以小写别名为键、模型规格字典为值的查找表。
     """
     alias_lookup = {}
     for spec in MODEL_SPECS:
-        for alias in {spec["public_id"], spec["request_id"], spec["actual_id"]}:
+        aliases = {spec["public_id"], spec["request_id"], spec["actual_id"]}
+        aliases.update(spec.get("legacy_ids", []))
+        for alias in aliases:
             alias_lookup[alias.lower()] = spec
     return alias_lookup
 
 
 MODEL_ALIAS_LOOKUP = build_model_alias_lookup()
+
+
+def find_retired_model(model_name):
+    """判断模型是否为上游已下线型号。
+
+    Args:
+        model_name (Any): 调用方传入的模型名。
+
+    Returns:
+        str | None: 命中时返回下线前的上游 `aiType`，否则返回 `None`。
+    """
+    if not isinstance(model_name, str):
+        return None
+    return RETIRED_MODEL_ALIASES.get(model_name.lower())
 
 
 def resolve_model(model_name):
@@ -397,7 +444,12 @@ def log_new_remote_models(access_token=None):
     local_aliases = {
         alias.lower()
         for spec in MODEL_SPECS
-        for alias in (spec["public_id"], spec["request_id"], spec["actual_id"])
+        for alias in (
+            spec.get("public_id"),
+            spec.get("request_id"),
+            spec.get("actual_id"),
+            *(spec.get("legacy_ids") or []),
+        )
         if isinstance(alias, str)
     }
 
@@ -408,6 +460,9 @@ def log_new_remote_models(access_token=None):
         ai_name = record.get("aiName")
         candidates = [value for value in (ai_type, simple_name, ai_name) if isinstance(value, str) and value]
         if any(candidate.lower() in local_aliases for candidate in candidates):
+            continue
+        # 已知下线/不可用的型号无需重复提示。
+        if any(candidate.lower() in RETIRED_MODEL_ALIASES for candidate in candidates):
             continue
         discovered.append({
             "aiType": ai_type,
@@ -626,6 +681,38 @@ def convert_messages_to_genai_format(messages):
             break
     
     return chat_info
+
+
+def split_messages_for_genai(messages):
+    """将消息列表拆分为上游所需的 `messages` 与 `chatInfo` 两部分。
+
+    上游会把 `chatInfo` 作为最后一条 user 消息追加到 `messages` 之后，即实际
+    生效的对话为 `messages + [{"role": "user", "content": chatInfo}]`。因此本函数
+    把末尾的 user 消息移入 `chatInfo`，使还原出的对话与调用方传入的完全一致。
+
+    若 `chatInfo` 为空，部分上游模型（如 Kimi-k3）会因追加了一条空消息而直接
+    返回校验错误，故这里始终尽力填充非空的 `chatInfo`。
+
+    Args:
+        messages (list[dict]): 归一化后的消息列表。
+
+    Returns:
+        tuple[list[dict], str]: 发送给上游的消息列表与 `chatInfo` 文本。
+    """
+    if not messages:
+        return [], ""
+
+    # 常规情况：末条即 user 消息，移出后可被上游原样追加回去，语义无损。
+    if messages[-1].get("role") == "user" and messages[-1].get("content"):
+        return list(messages[:-1]), messages[-1]["content"]
+
+    # 末条非 user（如 assistant 预填充）时无法无损还原顺序，
+    # 退化为保留全部消息并重述最后一条 user 内容，避免 chatInfo 为空。
+    for message in reversed(messages):
+        if message.get("role") == "user" and message.get("content"):
+            return list(messages), message["content"]
+
+    return list(messages), ""
 
 
 def normalize_content_for_genai(content):
@@ -962,11 +1049,12 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
         dict: 统一事件对象，`type` 可能为 `delta`、`done`、`meta` 或 `error`。
     """
     upstream_model, root_ai_type = resolve_model(model)
+    upstream_messages, chat_info = split_messages_for_genai(messages)
 
     # 这里保持与网页端接近的请求体结构，避免上游校验差异。
     genai_data = {
-        "chatInfo": "",
-        "messages": messages,
+        "chatInfo": chat_info,
+        "messages": upstream_messages,
         "type": "3",
         "stream": True,
         "aiType": upstream_model,
@@ -979,13 +1067,14 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
         genai_data.update(image_payload)
 
     logger.debug(
-        "Upstream request prepared: model=%s rootAiType=%s stream=%s maxToken=%s has_image=%s message_count=%s",
+        "Upstream request prepared: model=%s rootAiType=%s stream=%s maxToken=%s has_image=%s message_count=%s has_chat_info=%s",
         upstream_model,
         root_ai_type,
         genai_data.get("stream"),
         genai_data.get("maxToken"),
         bool(image_payload),
-        len(messages) if isinstance(messages, list) else 0,
+        len(upstream_messages),
+        bool(chat_info),
     )
 
     try:
@@ -994,7 +1083,7 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
             headers=build_genai_headers(access_token),
             json=genai_data,
             stream=True,
-            timeout=60
+            timeout=UPSTREAM_TIMEOUT
         )
 
         if response.status_code != 200:
@@ -1035,13 +1124,9 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
                             if choice.get("finish_reason") is not None:
                                 finished = True
 
-                        if finished:
-                            yield {
-                                "type": "done",
-                                "upstream_model": genai_json.get("model"),
-                            }
-                            break
-
+                        # 部分模型（如 deepseek-chat/pro）会把最后一段正文与
+                        # finish_reason 放在同一个 chunk 里，必须先取增量再结束，
+                        # 否则该段内容会被整段丢弃。
                         delta = extract_delta_from_genai(genai_json)
                         reasoning = delta.get("reasoning")
                         content = delta.get("content")
@@ -1054,12 +1139,45 @@ def stream_genai_events(messages, model, max_tokens, access_token=None, image_pa
                                 "content": content,
                             }
 
+                        if finished:
+                            yield {
+                                "type": "done",
+                                "upstream_model": genai_json.get("model"),
+                            }
+                            break
+
                 except json.JSONDecodeError:
                     pass
 
         yield {
             "type": "done",
             "upstream_model": None,
+        }
+
+    except requests.exceptions.ReadTimeout:
+        # 读取超时是「相邻数据块间隔」超限，最常见于推理模型思考期一直不吐字节。
+        read_timeout = UPSTREAM_TIMEOUT[1]
+        logger.error(
+            "Upstream read timeout after %ss (model=%s). Reasoning models may stay silent "
+            "longer than this; raise --upstream-read-timeout if it recurs.",
+            read_timeout,
+            upstream_model,
+        )
+        yield {
+            "type": "error",
+            "error": (
+                f"Upstream read timeout after {read_timeout}s waiting for model "
+                f"'{upstream_model}'. The model may need longer to start responding; "
+                f"increase --upstream-read-timeout."
+            ),
+        }
+
+    except requests.exceptions.ConnectTimeout:
+        connect_timeout = UPSTREAM_TIMEOUT[0]
+        logger.error("Upstream connect timeout after %ss (model=%s)", connect_timeout, upstream_model)
+        yield {
+            "type": "error",
+            "error": f"Upstream connect timeout after {connect_timeout}s. GenAI platform may be unreachable.",
         }
 
     except Exception as e:
@@ -1392,6 +1510,12 @@ def chat_completions():
         tools = get_request_tools(req_data)
         tool_choice = get_request_tool_choice(req_data)
         access_token = get_request_access_token()
+
+        retired_ai_type = find_retired_model(model)
+        if retired_ai_type:
+            logger.warning("Rejecting request for retired model: %s", model)
+            return jsonify({'error': f"Model '{model}' (upstream aiType '{retired_ai_type}') is no longer available on the GenAI platform"}), 400
+
         image_payload = prepare_image_payload(messages, model, access_token)
         
         # 转换消息格式
@@ -1463,6 +1587,11 @@ def responses():
         max_output_tokens = req_data.get('max_output_tokens', req_data.get('max_tokens', 30000))
         messages = build_response_input_messages(req_data.get('input'))
         access_token = get_request_access_token()
+
+        retired_ai_type = find_retired_model(model)
+        if retired_ai_type:
+            logger.warning("Rejecting request for retired model: %s", model)
+            return jsonify({'error': f"Model '{model}' (upstream aiType '{retired_ai_type}') is no longer available on the GenAI platform"}), 400
 
         if not messages:
             return jsonify({'error': 'No input message found'}), 400
