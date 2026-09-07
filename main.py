@@ -1,6 +1,7 @@
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import mimetypes
@@ -31,6 +32,10 @@ parser.add_argument('--account', type=str, default=None,
                     help='ShanghaiTech account in the format student_id@password, used to auto-login and get token')
 parser.add_argument('--upload-token', type=str, default='2ea38f293adb4abca21132feba61eaa3',
                     help='GenAI image upload API token header value')
+parser.add_argument('--key', type=str, default=None,
+                    help='Local API key required to access this proxy. When set, clients must send it '
+                         'via "Authorization: Bearer <key>" or the "api-key" header. Intended for LAN '
+                         'deployments; when omitted the proxy accepts all requests (default: disabled)')
 parser.add_argument('--host', type=str, default='0.0.0.0',
                     help='Bind address. Use 127.0.0.1 to accept local connections only '
                          '(default: 0.0.0.0, all interfaces)')
@@ -383,22 +388,83 @@ def resolve_model(model_name):
     return spec["request_id"], spec["root_ai_type"]
 
 
+def extract_bearer_key():
+    """从 OpenAI 兼容的认证头中提取调用方提供的本地 API key。
+
+    Returns:
+        str | None: 提取到的 key；未携带任何认证头时返回 `None`。
+    """
+    authorization = request.headers.get("Authorization", "")
+    if authorization.lower().startswith("bearer "):
+        key = authorization[7:].strip()
+        if key:
+            return key
+
+    for header_name in ("api-key", "X-API-Key"):
+        key = request.headers.get(header_name)
+        if key and key.strip():
+            return key.strip()
+
+    return None
+
+
+def require_api_key():
+    """校验本地 API key。
+
+    仅在启动时提供了 `--key` 时生效；未配置则不做任何限制，保持旧行为。
+
+    Returns:
+        tuple[Response, int] | None: 鉴权失败时返回 OpenAI 风格错误响应与状态码，
+        通过时返回 `None`。
+    """
+    if not args.key:
+        return None
+
+    provided_key = extract_bearer_key()
+    if not provided_key:
+        logger.warning("Rejected unauthenticated request from %s", request.remote_addr)
+        return jsonify({
+            "error": {
+                "message": "Missing API key. Provide it via 'Authorization: Bearer <key>' or the 'api-key' header.",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key",
+            }
+        }), 401
+
+    # 固定时间比较，避免通过响应耗时逐字节猜测 key。
+    if not hmac.compare_digest(provided_key, args.key):
+        logger.warning("Rejected request with invalid API key from %s", request.remote_addr)
+        return jsonify({
+            "error": {
+                "message": "Invalid API key.",
+                "type": "invalid_request_error",
+                "code": "invalid_api_key",
+            }
+        }), 401
+
+    return None
+
+
 def get_request_access_token():
-    """从 OpenAI 常用认证头中提取请求级 GenAI token。"""
+    """从请求头中提取调用方自带的上游 GenAI token。
+
+    注意：启用 `--key` 后，`Authorization` 与 `api-key` 头被本地鉴权占用，
+    此时只接受 `X-Access-Token` 作为上游 token，避免同一个头产生两种语义。
+
+    Returns:
+        str | None: 上游 GenAI token；未提供时返回 `None`，由启动参数兜底。
+    """
     if args.account:
         logger.debug("Ignoring request access token because --account is enabled")
         return None
 
-    authorization = request.headers.get("Authorization", "")
-    if authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
-        if token:
-            return token
+    token = request.headers.get("X-Access-Token")
+    if token and token.strip():
+        return token.strip()
 
-    for header_name in ("X-Access-Token", "api-key", "X-API-Key"):
-        token = request.headers.get(header_name)
-        if token:
-            return token.strip()
+    # 未启用本地鉴权时，沿用旧行为：把 OpenAI 风格认证头当作上游 token 透传。
+    if not args.key:
+        return extract_bearer_key()
 
     return None
 
@@ -1490,6 +1556,22 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
             yield f"data: {json.dumps(completed_event)}\n\n"
             yield "data: [DONE]\n\n"
             return
+
+@app.before_request
+def enforce_api_key():
+    """在所有业务接口前统一校验本地 API key。
+
+    `/health` 保持公开以便监控探活；CORS 预检请求不携带自定义头，也需放行。
+
+    Returns:
+        tuple[Response, int] | None: 鉴权失败时返回错误响应，通过时返回 `None`。
+    """
+    if request.method == "OPTIONS":
+        return None
+    if request.path == "/health":
+        return None
+    return require_api_key()
+
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():

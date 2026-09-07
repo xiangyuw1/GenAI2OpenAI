@@ -23,6 +23,7 @@ GenAI 是一个基于 Flask 的聊天机器人接口服务，兼容 OpenAI 的�
 | 图片输入（Vision）                        | ✅              | ✅（GPT 模型） | 服务端自动上传图片并注入 `imageUrl/width/height`           |
 | 模型列表接口（`GET /v1/models`）          | ✅              | ✅             | 返回本项目映射后的可用模型列表                             |
 | 认证头兼容（Bearer/API Key）              | ✅              | ✅             | 支持 `Authorization`、`X-Access-Token`、`api-key` 等       |
+| 访问鉴权（服务端 API Key）                | ✅              | ✅ 可选        | `--key` 启用后校验 `Authorization`/`api-key`，默认不鉴权   |
 
 ### Agent Tool 生态测试
 
@@ -41,17 +42,45 @@ GenAI 是一个基于 Flask 的聊天机器人接口服务，兼容 OpenAI 的�
 ### 启动服务
 
 ```bash
-uv run main.py [--token <token>] [--account <student_id@password>] [--upload-token <upload_token>] [--log-level INFO] [--port 5000]
+uv run main.py [--token <token>] [--account <student_id@password>] [--upload-token <upload_token>] [--key <api_key>] [--host 0.0.0.0] [--port 5000] [--log-level INFO]
 ```
 
 端口默认 5000。服务将在本地 `0.0.0.0:5000` 端口启动。
 
 可选参数：
 
-- `--token` ：若不在启动时提供，可由客户端在每次请求中通过 `Authorization: Bearer <token>` 或其他兼容 API key 请求头传递。
+- `--token` ：若不在启动时提供，可由客户端在每次请求中通过 `X-Access-Token` 请求头传递（未启用 `--key` 时也接受 `Authorization: Bearer <token>`）。
 - `--account`：上海科技大学统一身份认证账号，格式为 `学号@密码`。当未提供 `--token` 时，服务启动时会自动登录并获取 GenAI token。
 - `--upload-token`：图片上传接口 `token` 请求头值（默认内置项目当前可用值）。
+- `--key`：本服务的访问密钥。设置后所有 `/v1/*` 接口都必须携带该 key，适合部署到局域网时使用；不设置则不鉴权（默认）。详见[访问控制](#访问控制)。
+- `--host`：监听地址，默认 `0.0.0.0`（所有网卡）。设为 `127.0.0.1` 则仅接受本机连接。
+- `--port`：监听端口，默认 `5000`。
+- `--upstream-connect-timeout`：连接上游 GenAI 的超时秒数，默认 `10`。
+- `--upstream-read-timeout`：上游**相邻数据块之间**的最大间隔秒数，默认 `300`。推理模型（`gpt-6-astra`、`GPT-5.6-*`）会在服务端思考完毕后才返回首个字节，实测可静默 75 秒以上，因此该值不宜低于 120。
 - `--log-level`：控制台日志级别，支持 `DEBUG / INFO / WARNING / ERROR / CRITICAL`，默认 `INFO`。
+
+### 访问控制
+
+默认情况下服务不做任何鉴权。若要部署到局域网，建议启用 `--key`：
+
+```bash
+uv run main.py --account <学号@密码> --key my-secret-key
+```
+
+启用后，客户端需通过以下任一请求头提供该 key：
+
+- `Authorization: Bearer my-secret-key`（推荐，OpenAI SDK 填在 `api_key` 即可）
+- `api-key: my-secret-key`
+
+`GET /health` 始终公开，便于监控探活；其余 `/v1/*` 接口在 key 缺失或错误时返回 `401`。
+
+需要注意，**启用 `--key` 后，`Authorization` 与 `api-key` 头被本服务的鉴权占用**，不再透传给上游。此时若客户端仍想自带 GenAI token，请改用 `X-Access-Token` 头。
+
+若只在本机使用，也可以配合 `--host 127.0.0.1` 直接屏蔽外部访问：
+
+```bash
+uv run main.py --account <学号@密码> --host 127.0.0.1
+```
 
 ## 功能和用法
 
@@ -59,31 +88,36 @@ uv run main.py [--token <token>] [--account <student_id@password>] [--upload-tok
 - 支持流式（stream）及非流式响应，方便高效地获取 AI 回复。
 - `POST /v1/chat/completions` 支持基于提示词工程和 JSON 解析的 OpenAI `tools`/`tool_choice` 兼容工具调用，也兼容旧版 `functions`/`function_call` 入参。
 - `POST /v1/chat/completions` 支持图片输入（服务端自动上传到 GenAI 图片服务后再发起对话），当前**仅 GPT 系列模型可用**。
-- 提供 `/v1/models` 接口列出可用模型，如 `deepseek-pro`、`deepseek-chat`、`gpt-5.5`、`glm-5.1` 等。
+- 提供 `/v1/models` 接口列出可用模型，如 `deepseek-pro`、`deepseek-chat`、`gpt-5.5`、`glm-5.3-flash` 等。
 - 内置 `/health` 健康检查接口，用于服务状态监测。
 
 ### 支持模型
 
 | 模型 id           | 可用性 | 思维链 | 实测上下文长度     | first_token_delay | 输出速度       |
 | ----------------- | ------ | ------ | ------------------ | -------------- | -------------- |
-| deepseek-r1       | ✅     | ✅     | ~100k-128k tokens  | 0.880s         | 73.04 tokens/s | 
-| deepseek-v3       | ✅     | ❌     | ≥200k tokens       | 0.917s         | 83.85 tokens/s | 
-| glm-5.1           | ✅     | ❌     | ≥200k tokens       | 0.874s         | 98.15 tokens/s | 
-| minimax-m1        | ✅     | ✅     | ≥200k tokens       | 0.827s         | 129.94 tokens/s |
-| qwen3.5-397b-a17b | ✅     | ✅     | <100k tokens       | 0.851s         | 2.47 tokens/s  | 
+| glm-5.3-flash     | ✅     | ❌     | 待重测             | 0.874s         | 98.15 tokens/s |
+| qwen-3.8          | ✅     | ✅     | 待重测             | 0.851s         | 2.47 tokens/s  |
+| kimi-k3           | ✅     | ❌     | 未测试             | 未测试         | 未测试         |
+| gpt-6-astra       | ✅     | 隐藏   | 未测试（额度限制） | ~76s（推理期静默） | 未测试     |
+| gpt-5.6-sol       | ✅     | 隐藏   | 未测试（额度限制） | ~75s（推理期静默） | 未测试     |
+| gpt-5.6-terra     | ✅     | 隐藏   | 未测试（额度限制） | 未测试         | 未测试         |
+| gpt-5.6-luna      | ✅     | 隐藏   | 未测试（额度限制） | 未测试         | 未测试         |
 | gpt-5.5           | ✅     | 隐藏   | 未测试（额度限制） | 5.639s         | 128.93 tokens/s |
 | gpt-5.4           | ✅     | 隐藏   | 未测试（额度限制） | 4.205s         | 107.74 tokens/s |
 | gpt-5.2           | ✅     | 隐藏   | 未测试（额度限制） | 2.940s         | 142.57 tokens/s |
-| gpt-5             | ✅     | 隐藏   | 未测试（额度限制） | 41.525s        | 87.74 tokens/s | 
 | gpt-4.1           | ✅     | 隐藏   | 未测试（额度限制） | 2.534s         | 133.66 tokens/s |
-| gpt-4.1-mini      | ✅     | 隐藏   | 未测试（额度限制） | 2.385s         | 81.96 tokens/s | 
-| gpt-o4-mini       | ✅     | 隐藏   | 未测试（额度限制） | 11.030s        | 175.94 tokens/s |
 | gpt-o3            | ✅     | 隐藏   | 未测试（额度限制） | 11.612s        | 254.31 tokens/s |
-| deepseek-pro      | ✅     | 未知   | 未测试             | 1.012s         | 62.13 tokens/s | 
-| deepseek-chat     | ✅     | 未知   | 未测试             | 0.983s         | 19.62 tokens/s | 
+| deepseek-pro      | ✅     | ✅     | 未测试             | 1.012s         | 62.13 tokens/s |
+| deepseek-chat     | ✅     | ✅     | 未测试             | 0.983s         | 19.62 tokens/s |
+
+以下模型上游已下线，请求会返回 400：`deepseek-r1`、`deepseek-v3`、`minimax-m1`、`gpt-5`、`gpt-4.1-mini`、`gpt-o4-mini`。
+
+`glm-5.1`、`qwen3.5-397b-a17b` 为兼容别名，仍可解析到 `glm-5.3-flash` / `qwen-3.8`。
+注意平台曾在不改请求名的前提下替换底层模型（`chatglm` 现为 GLM-5.3-Flash，`qwen-instruct` 现为 Qwen-3.8），
+因此上表中的上下文长度等历史实测数据需要重新验证。
 
 兼容层同时兼容历史请求名和底层模型名，详见[模型列表](docs/模型列表.md)。
-以上信息最后更新于 `2026-05-08`。
+可用性最后验证于 `2026-09-07`，性能数据沿用 `2026-05-08` 的测试结果。
 
 ### 测试模型上下文长度
 
@@ -91,10 +125,10 @@ uv run main.py [--token <token>] [--account <student_id@password>] [--upload-tok
 
 ```bash
 # 大海捞针测试（推荐）
-uv run tools/skills/context_length_tester/context_length_tester.py --model deepseek-v3
+uv run tools/skills/context_length_tester/context_length_tester.py --model deepseek-chat
 
 # 快速探测 API 上限
-uv run tools/skills/context_length_tester/context_length_tester.py --model deepseek-v3 --mode probe
+uv run tools/skills/context_length_tester/context_length_tester.py --model deepseek-chat --mode probe
 ```
 
 测试方法采用**大海捞针法**（Needle in a Haystack）：在长文本中间插入关键信息，验证模型能否准确检索。这比简单的二分查找更能反映模型的真实上下文处理能力。
@@ -187,14 +221,12 @@ curl http://127.0.0.1:5000/v1/chat/completions \
 2. 打开浏览器开发者工具，随便发送一条消息，捕获名为`chat`的请求
 3. 复制请求标头中的`x-access-token`字段，即为`<token>`
 
-服务启动时可通过 `--token <token>` 设置默认 GenAI token；也可通过 `--account <学号@密码>` 在启动时自动登录获取 token。客户端也可以通过传统的 API key 传递 token，此时请求级 key 会覆盖启动参数中的默认 token，并作为上游 GenAI 的 `X-Access-Token` 使用。
+服务启动时可通过 `--token <token>` 设置默认 GenAI token；也可通过 `--account <学号@密码>` 在启动时自动登录获取 token。客户端也可以在请求头中自带 token，此时请求级 token 会覆盖启动参数中的默认值，并作为上游 GenAI 的 `X-Access-Token` 使用。
 
 支持的请求头：
 
-- `Authorization: Bearer <token>`（推荐，兼容 OpenAI SDK）
-- `X-Access-Token: <token>`
-- `api-key: <token>`
-- `X-API-Key: <token>`
+- `X-Access-Token: <token>`（任何情况下都可用）
+- `Authorization: Bearer <token>`、`api-key: <token>`、`X-API-Key: <token>`（**仅在未启用 `--key` 时**才被当作上游 token；启用后这些头用于本服务的访问鉴权，详见[访问控制](#访问控制)）
 
 示例：
 
@@ -202,7 +234,7 @@ curl http://127.0.0.1:5000/v1/chat/completions \
 curl http://127.0.0.1:5000/v1/chat/completions \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
-  -d '{"model":"deepseek-v3","messages":[{"role":"user","content":"你好"}]}'
+  -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"你好"}]}'
 ```
 
 ![图片说明](images/chrome.png)
