@@ -31,6 +31,9 @@ parser.add_argument('--account', type=str, default=None,
                     help='ShanghaiTech account in the format student_id@password, used to auto-login and get token')
 parser.add_argument('--upload-token', type=str, default='2ea38f293adb4abca21132feba61eaa3',
                     help='GenAI image upload API token header value')
+parser.add_argument('--host', type=str, default='0.0.0.0',
+                    help='Bind address. Use 127.0.0.1 to accept local connections only '
+                         '(default: 0.0.0.0, all interfaces)')
 parser.add_argument('--port', type=int, default=5000,
                     help='Flask server port (default: 5000)')
 parser.add_argument('--upstream-connect-timeout', type=float, default=10.0,
@@ -1677,4 +1680,7 @@ def health_check():
 
 if __name__ == '__main__':
     log_new_remote_models(args.token)
-    app.run(host='0.0.0.0', port=args.port, debug=False)
+    logger.info("Listening on http://%s:%s", args.host, args.port)
+    # threaded=True 让每个请求独立占用一个线程。本服务的耗时几乎全部是等待上游
+    # 响应（推理模型首字节可达 75s+），单线程下并发请求会互相阻塞。
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)
