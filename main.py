@@ -1430,7 +1430,9 @@ def collect_genai_response(messages, model, max_tokens, access_token=None, image
 def build_response_input_messages(input_value):
     """将 Responses API 输入归一化为消息列表。
 
-    当前仅处理文本输入，兼容字符串输入以及包含文本片段的数组输入。
+    除普通文本外，还需处理 agent 场景下的历史工具调用与工具结果：
+    `function_call` 与 `function_call_output` 是独立的 input item（不带 role），
+    若直接丢弃，模型就看不到上一轮工具的执行结果，会重复请求同一个工具。
 
     Args:
         input_value (str | list | Any): `/v1/responses` 的 `input` 字段。
@@ -1445,6 +1447,32 @@ def build_response_input_messages(input_value):
         messages = []
         for item in input_value:
             if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type")
+
+            # 助手上一轮发起的工具调用，转述为文本让上游理解对话历史。
+            if item_type == "function_call":
+                call_desc = json.dumps({
+                    "name": item.get("name"),
+                    "arguments": item.get("arguments"),
+                }, ensure_ascii=False)
+                messages.append({
+                    "role": "assistant",
+                    "content": f"已请求调用工具：\n{call_desc}",
+                })
+                continue
+
+            # 工具执行结果，必须回灌给模型，否则它无法基于结果继续推进。
+            if item_type == "function_call_output":
+                output = item.get("output")
+                if not isinstance(output, str):
+                    output = json.dumps(output, ensure_ascii=False)
+                tool_name = item.get("name") or item.get("call_id") or "tool"
+                messages.append({
+                    "role": "user",
+                    "content": f"工具 {tool_name} 返回结果：\n{output}",
+                })
                 continue
 
             role = item.get("role", "user")
@@ -1473,7 +1501,47 @@ def build_response_input_messages(input_value):
     return []
 
 
-def build_responses_output_items(content, reasoning_content, message_id, reasoning_id):
+def normalize_responses_tools(tools):
+    """把 Responses API 的 tools 结构转换为 Chat Completions 风格。
+
+    Responses API 的 function tool 是扁平结构（`{"type":"function","name":...}`），
+    而本项目的提示词工具层按 Chat Completions 的嵌套结构（`{"function":{...}}`）
+    编写，这里统一转换以便复用。
+
+    Args:
+        tools (Any): 请求中的 `tools` 字段。
+
+    Returns:
+        list[dict]: Chat Completions 风格的 tools 列表。
+    """
+    if not isinstance(tools, list):
+        return []
+
+    normalized = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") != "function":
+            # 仅支持 function 工具，内置工具（web_search 等）上游无法执行。
+            continue
+
+        if isinstance(tool.get("function"), dict):
+            normalized.append(tool)
+            continue
+
+        normalized.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name"),
+                "description": tool.get("description"),
+                "parameters": tool.get("parameters") or {},
+            },
+        })
+
+    return normalized
+
+
+def build_responses_output_items(content, reasoning_content, message_id, reasoning_id, tool_calls=None):
     """构造 Responses API 的 `output` 数组。
 
     Args:
@@ -1481,6 +1549,7 @@ def build_responses_output_items(content, reasoning_content, message_id, reasoni
         reasoning_content (str): 模型思维链内容，可为空。
         message_id (str): message item 的 id。
         reasoning_id (str): reasoning item 的 id。
+        tool_calls (list[dict] | None): Chat Completions 风格的工具调用列表。
 
     Returns:
         list[dict]: 符合 Responses API schema 的 output item 列表。
@@ -1497,6 +1566,22 @@ def build_responses_output_items(content, reasoning_content, message_id, reasoni
                 }
             ],
         })
+
+    # 有工具调用时，Responses API 用独立的 function_call item 表达，
+    # 而不是像 Chat Completions 那样挂在 message 上。
+    if tool_calls:
+        for call in tool_calls:
+            function = call.get("function", {})
+            output.append({
+                "id": f"fc_{uuid.uuid4().hex[:12]}",
+                "type": "function_call",
+                "call_id": call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                "name": function.get("name"),
+                "arguments": function.get("arguments") or "{}",
+                "status": "completed",
+            })
+        return output
+
     output.append({
         "id": message_id,
         "type": "message",
@@ -1513,7 +1598,7 @@ def build_responses_output_items(content, reasoning_content, message_id, reasoni
     return output
 
 
-def build_responses_object(response_id, model, created, status, output, max_output_tokens=None):
+def build_responses_object(response_id, model, created, status, output, max_output_tokens=None, tools=None):
     """构造 Responses API 的顶层 response 对象。
 
     OpenAI 官方 SDK 会按 schema 校验该对象，`parallel_tool_calls` / `tool_choice` /
@@ -1526,6 +1611,7 @@ def build_responses_object(response_id, model, created, status, output, max_outp
         status (str): `in_progress` / `completed` / `failed` 之一。
         output (list[dict]): output item 列表。
         max_output_tokens (int | None): 最大输出 token 数。
+        tools (list | None): 原样回显调用方传入的 tools。
 
     Returns:
         dict: 可直接序列化的 response 对象。
@@ -1538,8 +1624,8 @@ def build_responses_object(response_id, model, created, status, output, max_outp
         "model": model,
         "output": output,
         "parallel_tool_calls": False,
-        "tool_choice": "none",
-        "tools": [],
+        "tool_choice": "auto" if tools else "none",
+        "tools": tools or [],
         "temperature": None,
         "top_p": None,
         "max_output_tokens": max_output_tokens,
@@ -1553,7 +1639,242 @@ def build_responses_object(response_id, model, created, status, output, max_outp
     }
 
 
-def stream_responses_api(messages, model, max_tokens, access_token=None):
+def stream_responses_text(response_id, created, model, content, reasoning_content, max_tokens, tools):
+    """把已聚合完成的纯文本响应渲染为 Responses API SSE。
+
+    用于启用了 tools 但模型本轮未调用工具的场景：此时响应已被完整收集，
+    只需按 schema 补齐事件生命周期即可。
+
+    Args:
+        response_id (str): 响应 id。
+        created (int): 创建时间戳（秒）。
+        model (str): 调用方传入的模型名。
+        content (str): 模型正文。
+        reasoning_content (str): 思维链内容，可为空。
+        max_tokens (int | None): 最大输出 token 数。
+        tools (list | None): 调用方传入的 tools，用于回显。
+
+    Yields:
+        str: 符合 Responses API SSE 格式的文本片段。
+    """
+    sequence = 0
+    message_id = f"msg_{uuid.uuid4().hex[:12]}"
+    reasoning_id = f"rs_{uuid.uuid4().hex[:12]}"
+
+    def emit(payload):
+        nonlocal sequence
+        payload["sequence_number"] = sequence
+        sequence += 1
+        return f"data: {json.dumps(payload)}\n\n"
+
+    yield emit({
+        "type": "response.created",
+        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens, tools),
+    })
+    yield emit({
+        "type": "response.in_progress",
+        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens, tools),
+    })
+
+    output_index = 0
+    if reasoning_content:
+        yield emit({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {"id": reasoning_id, "type": "reasoning", "summary": []},
+        })
+        yield emit({
+            "type": "response.reasoning_summary_part.added",
+            "item_id": reasoning_id,
+            "output_index": output_index,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": ""},
+        })
+        yield emit({
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": reasoning_id,
+            "output_index": output_index,
+            "summary_index": 0,
+            "delta": reasoning_content,
+        })
+        yield emit({
+            "type": "response.reasoning_summary_text.done",
+            "item_id": reasoning_id,
+            "output_index": output_index,
+            "summary_index": 0,
+            "text": reasoning_content,
+        })
+        yield emit({
+            "type": "response.reasoning_summary_part.done",
+            "item_id": reasoning_id,
+            "output_index": output_index,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": reasoning_content},
+        })
+        yield emit({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": {
+                "id": reasoning_id,
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": reasoning_content}],
+            },
+        })
+        output_index += 1
+
+    yield emit({
+        "type": "response.output_item.added",
+        "output_index": output_index,
+        "item": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "in_progress",
+            "content": [],
+        },
+    })
+    yield emit({
+        "type": "response.content_part.added",
+        "item_id": message_id,
+        "output_index": output_index,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": "", "annotations": []},
+    })
+    if content:
+        yield emit({
+            "type": "response.output_text.delta",
+            "item_id": message_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "delta": content,
+            "logprobs": [],
+        })
+    yield emit({
+        "type": "response.output_text.done",
+        "item_id": message_id,
+        "output_index": output_index,
+        "content_index": 0,
+        "text": content,
+        "logprobs": [],
+    })
+    yield emit({
+        "type": "response.content_part.done",
+        "item_id": message_id,
+        "output_index": output_index,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": content, "annotations": []},
+    })
+    yield emit({
+        "type": "response.output_item.done",
+        "output_index": output_index,
+        "item": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": content, "annotations": []}],
+        },
+    })
+
+    output = build_responses_output_items(content, reasoning_content, message_id, reasoning_id)
+    yield emit({
+        "type": "response.completed",
+        "response": build_responses_object(response_id, model, created, "completed", output, max_tokens, tools),
+    })
+    yield "data: [DONE]\n\n"
+
+
+def stream_responses_tool_calls(response_id, created, model, content, tool_calls, reasoning_content, max_tokens, tools):
+    """把已解析出的工具调用渲染为 Responses API SSE。
+
+    工具调用需要完整文本才能解析，因此该分支由调用方先聚合完响应再进入，
+    这里只负责按 schema 补齐事件生命周期。
+
+    Args:
+        response_id (str): 响应 id。
+        created (int): 创建时间戳（秒）。
+        model (str): 调用方传入的模型名。
+        content (str): 模型正文，无工具调用时作为普通消息返回。
+        tool_calls (list[dict]): Chat Completions 风格的工具调用列表。
+        reasoning_content (str): 思维链内容，可为空。
+        max_tokens (int | None): 最大输出 token 数。
+        tools (list | None): 调用方传入的 tools，用于回显。
+
+    Yields:
+        str: 符合 Responses API SSE 格式的文本片段。
+    """
+    sequence = 0
+
+    def emit(payload):
+        nonlocal sequence
+        payload["sequence_number"] = sequence
+        sequence += 1
+        return f"data: {json.dumps(payload)}\n\n"
+
+    yield emit({
+        "type": "response.created",
+        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens, tools),
+    })
+    yield emit({
+        "type": "response.in_progress",
+        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens, tools),
+    })
+
+    output_index = 0
+    output_items = []
+
+    for call in tool_calls:
+        function = call.get("function", {})
+        item_id = f"fc_{uuid.uuid4().hex[:12]}"
+        call_id = call.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+        name = function.get("name")
+        arguments = function.get("arguments") or "{}"
+
+        item = {
+            "id": item_id,
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": "",
+            "status": "in_progress",
+        }
+        yield emit({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": item,
+        })
+        yield emit({
+            "type": "response.function_call_arguments.delta",
+            "item_id": item_id,
+            "output_index": output_index,
+            "delta": arguments,
+        })
+        yield emit({
+            "type": "response.function_call_arguments.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "name": name,
+            "arguments": arguments,
+        })
+        done_item = dict(item, arguments=arguments, status="completed")
+        yield emit({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": done_item,
+        })
+        output_items.append(done_item)
+        output_index += 1
+
+    yield emit({
+        "type": "response.completed",
+        "response": build_responses_object(
+            response_id, model, created, "completed", output_items, max_tokens, tools
+        ),
+    })
+    yield "data: [DONE]\n\n"
+
+
+def stream_responses_api(messages, model, max_tokens, access_token=None, tools=None):
     """将内部事件流转换为 Responses API SSE。
 
     必须输出完整的事件生命周期（output_item.added -> content_part.added ->
@@ -1567,6 +1888,7 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
         model (str): 调用方传入的模型名。
         max_tokens (int | None): 最大输出 token 数。
         access_token (str | None): 请求级 GenAI token，未提供时使用启动参数。
+        tools (list | None): 调用方传入的 tools，用于回显到 response 对象。
 
     Yields:
         str: 符合 Responses API SSE 格式的文本片段。
@@ -1587,11 +1909,11 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
 
     yield emit({
         "type": "response.created",
-        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens),
+        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens, tools),
     })
     yield emit({
         "type": "response.in_progress",
-        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens),
+        "response": build_responses_object(response_id, model, created, "in_progress", [], max_tokens, tools),
     })
 
     # reasoning 与 message 是两个独立的 output item，按需惰性开启。
@@ -1603,7 +1925,7 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
 
     for event in stream_genai_events(messages, model, max_tokens, access_token):
         if event["type"] == "error":
-            failed_response = build_responses_object(response_id, model, created, "failed", [], max_tokens)
+            failed_response = build_responses_object(response_id, model, created, "failed", [], max_tokens, tools)
             failed_response["error"] = {"code": "upstream_error", "message": event["error"]}
             yield emit({"type": "response.failed", "response": failed_response})
             yield "data: [DONE]\n\n"
@@ -1781,7 +2103,7 @@ def stream_responses_api(messages, model, max_tokens, access_token=None):
             output = build_responses_output_items(final_text, reasoning_text, message_id, reasoning_id)
             yield emit({
                 "type": "response.completed",
-                "response": build_responses_object(response_id, model, created, "completed", output, max_tokens),
+                "response": build_responses_object(response_id, model, created, "completed", output, max_tokens, tools),
             })
             yield "data: [DONE]\n\n"
             return
@@ -1901,6 +2223,9 @@ def responses():
         max_output_tokens = req_data.get('max_output_tokens', req_data.get('max_tokens', 30000))
         messages = build_response_input_messages(req_data.get('input'))
         access_token = get_request_access_token()
+        raw_tools = req_data.get('tools')
+        tools = normalize_responses_tools(raw_tools)
+        tool_choice = req_data.get('tool_choice', 'auto')
 
         retired_ai_type = find_retired_model(model)
         if retired_ai_type:
@@ -1910,9 +2235,61 @@ def responses():
         if not messages:
             return jsonify({'error': 'No input message found'}), 400
 
+        # Responses API 的 instructions 等价于 system 提示词。
+        instructions = req_data.get('instructions')
+        if isinstance(instructions, str) and instructions.strip():
+            messages = [{"role": "system", "content": instructions}] + messages
+
+        tools_enabled = should_enable_tools(tools, tool_choice)
+        upstream_messages = normalize_messages_for_genai(messages)
+        if tools_enabled:
+            upstream_messages = build_tool_calling_messages(upstream_messages, tools, tool_choice)
+
         if stream:
+            if tools_enabled:
+                # 工具调用需要完整文本才能解析，先聚合再渲染事件流。
+                collected = collect_genai_response(upstream_messages, model, max_output_tokens, access_token)
+                tool_calls = parse_tool_calls_from_content(collected["content"])
+                if tool_calls:
+                    return Response(
+                        stream_with_context(stream_responses_tool_calls(
+                            f"resp_{uuid.uuid4().hex}",
+                            int(datetime.now().timestamp()),
+                            model,
+                            collected["content"],
+                            tool_calls,
+                            collected["reasoning_content"],
+                            max_output_tokens,
+                            raw_tools,
+                        )),
+                        mimetype='text/event-stream',
+                        headers={
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive',
+                            'Content-Type': 'text/event-stream',
+                        }
+                    )
+                # 模型这轮没调工具，退化为普通文本流。
+                return Response(
+                    stream_with_context(stream_responses_text(
+                        f"resp_{uuid.uuid4().hex}",
+                        int(datetime.now().timestamp()),
+                        model,
+                        collected["content"],
+                        collected["reasoning_content"],
+                        max_output_tokens,
+                        raw_tools,
+                    )),
+                    mimetype='text/event-stream',
+                    headers={
+                        'Cache-Control': 'no-cache',
+                        'Connection': 'keep-alive',
+                        'Content-Type': 'text/event-stream',
+                    }
+                )
+
             return Response(
-                stream_with_context(stream_responses_api(messages, model, max_output_tokens, access_token)),
+                stream_with_context(stream_responses_api(upstream_messages, model, max_output_tokens, access_token, raw_tools)),
                 mimetype='text/event-stream',
                 headers={
                     'Cache-Control': 'no-cache',
@@ -1922,13 +2299,15 @@ def responses():
             )
 
         # 非流式返回时，将 reasoning 和 message 组装到 output 数组中。
-        collected = collect_genai_response(messages, model, max_output_tokens, access_token)
+        collected = collect_genai_response(upstream_messages, model, max_output_tokens, access_token)
+        tool_calls = parse_tool_calls_from_content(collected["content"]) if tools_enabled else []
         response_id = f"resp_{uuid.uuid4().hex}"
         output = build_responses_output_items(
             collected["content"],
             collected["reasoning_content"],
             f"msg_{uuid.uuid4().hex[:12]}",
             f"rs_{uuid.uuid4().hex[:12]}",
+            tool_calls,
         )
 
         response_object = build_responses_object(
@@ -1938,8 +2317,9 @@ def responses():
             "completed",
             output,
             max_output_tokens,
+            raw_tools,
         )
-        response_object["output_text"] = collected["content"]
+        response_object["output_text"] = "" if tool_calls else collected["content"]
         return jsonify(response_object)
 
     except Exception as e:
