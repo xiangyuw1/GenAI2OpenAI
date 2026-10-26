@@ -204,7 +204,10 @@ cython_debug/
 # Local research artifacts
 /temp
 /AGENTS.md
+
+# 上游登录凭据缓存（包含 JWT / 学号），禁止提交
 .genai_token_cache
+.genai_token_cache.*
 
 # Marimo
 marimo/_static/

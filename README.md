@@ -21,6 +21,8 @@ GenAI 是一个基于 Flask 的聊天机器人接口服务，兼容 OpenAI 的�
 | Tool Calling（`tools/tool_choice`）       | ✅ 原生         | ✅ 提示词兼容  | 上游无原生工具调用，本项目做 JSON 约定与本地解析           |
 | 旧版函数调用（`functions/function_call`） | 已逐步废弃      | ✅ 兼容        | 自动转换为 `tools/tool_choice` 语义                        |
 | 图片输入（Vision）                        | ✅              | ✅（GPT 模型） | 服务端自动上传图片并注入 `imageUrl/width/height`           |
+| `POST /v1/images/generations`             | ✅ 原生支持     | ✅ 已兼容      | 文生图，支持 URL / base64 返回与 n/size/quality/style      |
+| `POST /v1/images/edits`                   | ✅ 原生支持     | ✅ 部分兼容    | 参考图生成/编辑，最多 4 张；上游无 mask，`mask` 会被忽略   |
 | 模型列表接口（`GET /v1/models`）          | ✅              | ✅             | 返回本项目映射后的可用模型列表                             |
 | 认证头兼容（Bearer/API Key）              | ✅              | ✅             | 支持 `Authorization`、`X-Access-Token`、`api-key` 等       |
 | 访问鉴权（服务端 API Key）                | ✅              | ✅ 可选        | `--key` 启用后校验 `Authorization`/`api-key`，默认不鉴权   |
@@ -56,7 +58,7 @@ uv run main.py [--token <token>] [--account <student_id@password>] [--upload-tok
 - `--host`：监听地址，默认 `0.0.0.0`（所有网卡）。设为 `127.0.0.1` 则仅接受本机连接。
 - `--port`：监听端口，默认 `5000`。
 - `--upstream-connect-timeout`：连接上游 GenAI 的超时秒数，默认 `10`。
-- `--upstream-read-timeout`：上游**相邻数据块之间**的最大间隔秒数，默认 `300`。推理模型（`gpt-6-astra`、`GPT-5.6-*`）会在服务端思考完毕后才返回首个字节，实测可静默 75 秒以上，因此该值不宜低于 120。
+- `--upstream-read-timeout`：上游**相邻数据块之间**的最大间隔秒数，默认 `300`。推理模型（`gpt-6-astra`、`gpt-6.1-sol`、`gpt-6-luna`）会在服务端思考完毕后才返回首个字节，实测可静默 75 秒以上，因此该值不宜低于 120。
 - `--log-level`：控制台日志级别，支持 `DEBUG / INFO / WARNING / ERROR / CRITICAL`，默认 `INFO`。
 
 ### 访问控制
@@ -88,36 +90,67 @@ uv run main.py --account <学号@密码> --host 127.0.0.1
 - 支持流式（stream）及非流式响应，方便高效地获取 AI 回复。
 - `POST /v1/chat/completions` 支持基于提示词工程和 JSON 解析的 OpenAI `tools`/`tool_choice` 兼容工具调用，也兼容旧版 `functions`/`function_call` 入参。
 - `POST /v1/chat/completions` 支持图片输入（服务端自动上传到 GenAI 图片服务后再发起对话），当前**仅 GPT 系列模型可用**。
-- 提供 `/v1/models` 接口列出可用模型，如 `deepseek-pro`、`deepseek-chat`、`gpt-5.5`、`glm-5.3-flash` 等。
+- 提供 `POST /v1/images/generations` 与 `POST /v1/images/edits`，兼容 OpenAI Images API，支持 `gpt-image-2.5-sunburst`。
+- 提供 `/v1/models` 接口列出可用模型，如 `deepseek-v4.1-flash`、`deepseek-chat`、`gpt-6.1-sol`、`gpt-image-2.5-sunburst`、`glm-5.3-flash` 等。
 - 内置 `/health` 健康检查接口，用于服务状态监测。
 
 ### 支持模型
 
-| 模型 id           | 可用性 | 思维链 | 实测上下文长度     | first_token_delay | 输出速度       |
-| ----------------- | ------ | ------ | ------------------ | -------------- | -------------- |
-| glm-5.3-flash     | ✅     | ❌     | 待重测             | 0.874s         | 98.15 tokens/s |
-| qwen-3.8          | ✅     | ✅     | 待重测             | 0.851s         | 2.47 tokens/s  |
-| kimi-k3           | ✅     | ❌     | 未测试             | 未测试         | 未测试         |
-| gpt-6-astra       | ✅     | 隐藏   | 未测试（额度限制） | ~76s（推理期静默） | 未测试     |
-| gpt-5.6-sol       | ✅     | 隐藏   | 未测试（额度限制） | ~75s（推理期静默） | 未测试     |
-| gpt-5.6-terra     | ✅     | 隐藏   | 未测试（额度限制） | 未测试         | 未测试         |
-| gpt-5.6-luna      | ✅     | 隐藏   | 未测试（额度限制） | 未测试         | 未测试         |
-| gpt-5.5           | ✅     | 隐藏   | 未测试（额度限制） | 5.639s         | 128.93 tokens/s |
-| gpt-5.4           | ✅     | 隐藏   | 未测试（额度限制） | 4.205s         | 107.74 tokens/s |
-| gpt-5.2           | ✅     | 隐藏   | 未测试（额度限制） | 2.940s         | 142.57 tokens/s |
-| gpt-4.1           | ✅     | 隐藏   | 未测试（额度限制） | 2.534s         | 133.66 tokens/s |
-| gpt-o3            | ✅     | 隐藏   | 未测试（额度限制） | 11.612s        | 254.31 tokens/s |
-| deepseek-pro      | ✅     | ✅     | 未测试             | 1.012s         | 62.13 tokens/s |
-| deepseek-chat     | ✅     | ✅     | 未测试             | 0.983s         | 19.62 tokens/s |
+| 模型 id                 | 可用性 | 思维链 | 实测上下文长度     | first_token_delay | 输出速度       |
+| ----------------------- | ------ | ------ | ------------------ | -------------- | -------------- |
+| glm-5.3-flash           | ✅     | ❌     | 待重测             | 0.874s         | 98.15 tokens/s |
+| qwen-3.8                | ✅     | ❌     | 待重测             | 0.851s         | 2.47 tokens/s  |
+| kimi-k3                 | ✅     | ✅     | 未测试             | 未测试         | 未测试         |
+| gpt-6-astra             | ✅     | 隐藏   | 未测试（额度限制） | ~76s（推理期静默） | 未测试     |
+| gpt-6.1-sol             | ✅     | 隐藏   | 未测试（额度限制） | 未测试         | 未测试         |
+| gpt-6-luna              | ✅     | 隐藏   | 未测试（额度限制） | 未测试         | 未测试         |
+| deepseek-v4.1-flash     | ✅     | ❌     | 未测试             | 未测试         | 未测试         |
+| deepseek-chat           | ✅     | ✅     | 未测试             | 0.983s         | 19.62 tokens/s |
+| gpt-image-2.5-sunburst  | ✅     | —      | 不适用（图片生成） | 约 15-40s      | 不适用         |
 
-以下模型上游已下线，请求会返回 400：`deepseek-r1`、`deepseek-v3`、`minimax-m1`、`gpt-5`、`gpt-4.1-mini`、`gpt-o4-mini`。
+以下模型上游已下线或当前账号无权限，请求会返回 400：`deepseek-r1`、`deepseek-v3`、`minimax-m1`、
+`gpt-5`、`gpt-4.1-mini`、`gpt-o4-mini`、`gpt-5.6-sol/terra/luna`、`gpt-5.5`、`gpt-5.4`、`gpt-5.2`、
+`gpt-4.1`、`gpt-o3`、`gpt-image-1.5`。
 
-`glm-5.1`、`qwen3.5-397b-a17b` 为兼容别名，仍可解析到 `glm-5.3-flash` / `qwen-3.8`。
-注意平台曾在不改请求名的前提下替换底层模型（`chatglm` 现为 GLM-5.3-Flash，`qwen-instruct` 现为 Qwen-3.8），
-因此上表中的上下文长度等历史实测数据需要重新验证。
+`glm-5.1`、`qwen3.5-397b-a17b`、`deepseek-pro`、`deepseek-v4-pro` 为兼容别名，分别解析到
+`glm-5.3-flash` / `qwen-3.8` / `deepseek-v4.1-flash`。
+注意平台曾多次在不改请求名的前提下替换底层模型（`chatglm` 现为 GLM-5.3-Flash，`qwen-instruct` 现为
+Qwen-3.8，`deepseek-pro` 现为 DeepSeek-V4.1-Flash），因此上表中的上下文长度等历史实测数据需要重新验证。
 
 兼容层同时兼容历史请求名和底层模型名，详见[模型列表](docs/模型列表.md)。
-可用性最后验证于 `2026-09-07`，性能数据沿用 `2026-05-08` 的测试结果。
+可用性最后验证于 `2026-10-26`，性能数据除注明外沿用 `2026-05-08` 的测试结果。
+
+图片生成模型通过 OpenAI Images API 调用：
+
+```bash
+# 文生图（URL 返回）
+curl http://127.0.0.1:5000/v1/images/generations \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2.5-sunburst",
+    "prompt": "一只戴墨镜的橘猫，像素风格",
+    "n": 1,
+    "size": "1024x1024",
+    "quality": "low",
+    "response_format": "url"
+  }'
+
+# 带参考图生成/编辑（multipart，最多 4 张）
+curl http://127.0.0.1:5000/v1/images/edits \
+  -H "Authorization: Bearer <token>" \
+  -F "model=gpt-image-2.5-sunburst" \
+  -F "prompt=把墨镜换成红色" \
+  -F "image=@cat.png" \
+  -F "size=1024x1024" \
+  -F "response_format=url"
+```
+
+支持的参数：`size`（总像素 655360~8294400）、`quality`（low/medium/high/auto）、
+`style`（vivid/natural）、`output_format`（png/jpeg/webp）、`response_format`（url/b64_json）、
+`background`（auto/opaque/transparent，上游实测仍返回 opaque，透明背景暂不生效）。上游没有 mask 语义，
+`/v1/images/edits` 会忽略 `mask`。
+图片生成模型不能用于 `/v1/chat/completions` 或 `/v1/responses`。
 
 ### 测试模型上下文长度
 
@@ -141,7 +174,7 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 
 ```json
 {
-  "model": "gpt-5.5",
+  "model": "gpt-6.1-sol",
   "messages": [{ "role": "user", "content": "上海今天适合带伞吗？" }],
   "tools": [
     {
@@ -187,7 +220,7 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 
 限制：
 
-- 图片能力仅对 GPT/Azure 路由模型开放（如 `gpt-5.5`、`gpt-4.1`）。
+- 图片能力仅对 GPT/Azure 路由模型开放（如 `gpt-6.1-sol`、`gpt-6-astra`、`gpt-6-luna`）。
 - 若对非 GPT 模型传图，请求会返回错误：`Image input is only available for GPT models`。
 
 示例：
@@ -197,7 +230,7 @@ curl http://127.0.0.1:5000/v1/chat/completions \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-5.5",
+    "model": "gpt-6.1-sol",
     "messages": [
       {
         "role": "user",

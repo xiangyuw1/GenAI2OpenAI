@@ -28,7 +28,7 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--model` | 必填 | 模型名称，如 deepseek-v3, gpt-4.1 |
+| `--model` | 必填 | 模型名称，如 deepseek-chat, gpt-6.1-sol |
 | `--mode` | needle | 测试模式: probe 或 needle |
 | `--api-url` | http://localhost:6001/v1/chat/completions | API 端点 |
 | `--api-key` | sk-test | API 密钥 |

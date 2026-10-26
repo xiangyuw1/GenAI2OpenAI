@@ -45,8 +45,8 @@ parser.add_argument('--upstream-connect-timeout', type=float, default=10.0,
                     help='Upstream TCP connect timeout in seconds (default: 10)')
 parser.add_argument('--upstream-read-timeout', type=float, default=300.0,
                     help='Upstream inter-chunk read timeout in seconds. Reasoning models such as '
-                         'gpt-6-astra / GPT-5.6-* buffer server-side and can stay silent for 60-90s '
-                         'before the first token (default: 300)')
+                         'gpt-6-astra / gpt-6.1-sol / gpt-6-luna buffer server-side and can stay '
+                         'silent for 60-90s before the first token (default: 300)')
 parser.add_argument('--log-level', type=str, default='INFO',
                     choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                     help='Console log level (default: INFO)')
@@ -66,7 +66,7 @@ TOKEN_CACHE_PATH = os.path.join(BASE_DIR, ".genai_token_cache")
 
 # 上游超时统一使用 (连接超时, 读取超时) 二元组。读取超时是 *相邻数据块* 之间的
 # 间隔上限，而非整个请求的总时长，因此长回答只要持续有数据就不会被截断。
-# 推理型模型（gpt-6-astra、GPT-5.6-* 等）会在服务端完成思考后才吐第一个字节，
+# 推理型模型（gpt-6-astra、gpt-6.1-sol、gpt-6-luna 等）会在服务端完成思考后才吐第一个字节，
 # 实测首字节延迟可达 75s 以上，故默认读取超时放宽到 300s。
 UPSTREAM_TIMEOUT = (args.upstream_connect_timeout, args.upstream_read_timeout)
 
@@ -250,64 +250,41 @@ MODEL_SPECS = [
         "root_ai_type": "azure",
     },
     {
-        "public_id": "gpt-5.6-sol",
-        "request_id": "GPT-5.6-SOL",
-        "actual_id": "GPT-5.6-SOL",
+        "public_id": "gpt-6.1-sol",
+        "request_id": "GPT-6.1-Sol",
+        "actual_id": "GPT-6.1-Sol",
+        "root_ai_type": "azure",
+        "legacy_ids": ["gpt6.1-sol"],
+    },
+    {
+        "public_id": "gpt-6-luna",
+        "request_id": "GPT-6-Luna",
+        "actual_id": "GPT-6-Luna",
         "root_ai_type": "azure",
     },
     {
-        "public_id": "gpt-5.6-terra",
-        "request_id": "GPT-5.6-Terra",
-        "actual_id": "GPT-5.6-Terra",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-5.6-luna",
-        "request_id": "GPT-5.6-Luna",
-        "actual_id": "GPT-5.6-Luna",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-5.5",
-        "request_id": "GPT-5.5",
-        "actual_id": "gpt-5.5-2026-04-24",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-5.4",
-        "request_id": "GPT-5.4",
-        "actual_id": "gpt-5.4-2026-03-05",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-5.2",
-        "request_id": "GPT-5.2",
-        "actual_id": "gpt-5.2-2025-12-11",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-4.1",
-        "request_id": "GPT-4.1",
-        "actual_id": "gpt-4.1-2025-04-14",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "gpt-o3",
-        "request_id": "o3",
-        "actual_id": "o3-2025-04-16",
-        "root_ai_type": "azure",
-    },
-    {
-        "public_id": "deepseek-pro",
+        # 上游 aiType 仍是 deepseek-pro，但底层已换为 DeepSeek-V4.1-Flash。
+        "public_id": "deepseek-v4.1-flash",
         "request_id": "deepseek-pro",
-        "actual_id": "deepseek-v4-pro",
+        "actual_id": "deepseek-v4.1-flash",
         "root_ai_type": "xinference",
+        "legacy_ids": ["deepseek-pro", "deepseek-v4-pro", "DeepSeek-V4.1-Flash"],
     },
     {
+        # 上游模型列表已不再展示 deepseek-chat，但对话端点实测仍可用。
         "public_id": "deepseek-chat",
         "request_id": "deepseek-chat",
         "actual_id": "deepseek-v4-flash",
         "root_ai_type": "xinference",
+    },
+    {
+        # 图片生成模型：上游 aiType 为 GPT-Image-2，展示名为 GPT-Image-2.5-Sunburst。
+        "public_id": "gpt-image-2.5-sunburst",
+        "request_id": "GPT-Image-2",
+        "actual_id": "GPT-Image-2.5-Sunburst",
+        "root_ai_type": "azure",
+        "image_generation": True,
+        "legacy_ids": ["gpt-image-2", "gpt-image-2.5", "GPT-Image-2.5"],
     },
 ]
 
@@ -327,8 +304,22 @@ RETIRED_MODEL_ALIASES = {
     "gpt-o4-mini": "o4-mini",
     "o4-mini": "o4-mini",
     "o4-mini-2025-04-16": "o4-mini",
-    # 图片模型在对话端点不可用（GPT-Image-2 返回 400，gpt-image-1.5 无可用节点）。
-    "gpt-image-2": "GPT-Image-2",
+    # 2026-10-26 实测上游已无使用权限的 GPT 系列。
+    "gpt-5.6-sol": "GPT-5.6-SOL",
+    "gpt-5.6-terra": "GPT-5.6-Terra",
+    "gpt-5.6-luna": "GPT-5.6-Luna",
+    "gpt-5.5": "GPT-5.5",
+    "gpt-5.5-2026-04-24": "GPT-5.5",
+    "gpt-5.4": "GPT-5.4",
+    "gpt-5.4-2026-03-05": "GPT-5.4",
+    "gpt-5.2": "GPT-5.2",
+    "gpt-5.2-2025-12-11": "GPT-5.2",
+    "gpt-4.1": "GPT-4.1",
+    "gpt-4.1-2025-04-14": "GPT-4.1",
+    "gpt-o3": "o3",
+    "o3": "o3",
+    "o3-2025-04-16": "o3",
+    # gpt-image-1.5 在对话端点无可用节点；GPT-Image-2 已恢复并改由图片生成端点提供。
     "gpt-image-1.5": "gpt-image-1.5",
 }
 
@@ -728,6 +719,295 @@ def prepare_image_payload(messages, model, access_token=None):
     image_payload = upload_image_to_genai(image_bytes, filename, mime_type, access_token)
     logger.debug("Prepared image payload: %s", image_payload)
     return image_payload
+
+
+# 图片生成参数约束，来自 GenAI 图片工作台的默认值/可选值。
+IMAGE_DEFAULT_MODEL = "gpt-image-2.5-sunburst"
+IMAGE_MAX_REFERENCE_IMAGES = 4
+IMAGE_QUALITY_ALIASES = {"standard": "medium", "hd": "high"}
+IMAGE_SIZE_MIN_PIXELS = 655360
+IMAGE_SIZE_MAX_PIXELS = 8294400
+
+
+def is_image_generation_model(model_name):
+    """判断模型是否仅用于 `/v1/images/*` 图片生成。"""
+    if not isinstance(model_name, str):
+        return False
+    spec = MODEL_ALIAS_LOOKUP.get(model_name.lower())
+    return bool(spec and spec.get("image_generation"))
+
+
+def resolve_image_model(model_name):
+    """解析图片生成模型名，返回对应的模型规格。
+
+    Args:
+        model_name (Any): 调用方传入的模型名；为空时使用默认图片模型。
+
+    Returns:
+        dict: `MODEL_SPECS` 中带 `image_generation` 标记的条目。
+
+    Raises:
+        ValueError: 模型未登记或不是图片生成模型。
+    """
+    if not model_name:
+        model_name = IMAGE_DEFAULT_MODEL
+    if not isinstance(model_name, str):
+        raise ValueError("Image model must be a string")
+
+    spec = MODEL_ALIAS_LOOKUP.get(model_name.lower())
+    if spec is None or not spec.get("image_generation"):
+        available = ", ".join(
+            item["public_id"] for item in MODEL_SPECS if item.get("image_generation")
+        )
+        raise ValueError(f"Unknown image model '{model_name}'. Available image models: {available}")
+    return spec
+
+
+def normalize_image_size(size):
+    """把 OpenAI 的 size 参数转换为上游接受的 `宽x高` 字符串。"""
+    if not size or (isinstance(size, str) and size.strip().lower() == "auto"):
+        return "1024x1024"
+    if not isinstance(size, str):
+        raise ValueError("size must be a string like 1024x1024")
+
+    normalized = size.strip().lower().replace("×", "x").replace("*", "x")
+    parts = normalized.split("x")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        raise ValueError("size must be in the form <width>x<height>, e.g. 1024x1024")
+
+    width, height = int(parts[0]), int(parts[1])
+    pixels = width * height
+    if pixels < IMAGE_SIZE_MIN_PIXELS or pixels > IMAGE_SIZE_MAX_PIXELS:
+        raise ValueError(
+            f"size {width}x{height} is out of range; total pixels must be between "
+            f"{IMAGE_SIZE_MIN_PIXELS} and {IMAGE_SIZE_MAX_PIXELS}"
+        )
+    return f"{width}x{height}"
+
+
+def normalize_image_quality(quality):
+    """把 OpenAI 的 quality 参数映射为上游接受的值。"""
+    if not quality:
+        return "auto"
+    if not isinstance(quality, str):
+        raise ValueError("quality must be a string")
+
+    normalized = quality.strip().lower()
+    normalized = IMAGE_QUALITY_ALIASES.get(normalized, normalized)
+    if normalized not in {"low", "medium", "high", "auto"}:
+        raise ValueError("quality must be one of: low, medium, high, auto")
+    return normalized
+
+
+def normalize_image_style(style):
+    """把 OpenAI 的 style 参数映射为上游接受的值。"""
+    if not style:
+        return "vivid"
+    if not isinstance(style, str):
+        raise ValueError("style must be a string")
+
+    normalized = style.strip().lower()
+    if normalized not in {"vivid", "natural"}:
+        raise ValueError("style must be one of: vivid, natural")
+    return normalized
+
+
+def normalize_image_format(output_format):
+    """规范化图片输出格式。"""
+    if not output_format:
+        return "png"
+    if not isinstance(output_format, str):
+        raise ValueError("output_format must be a string")
+
+    normalized = output_format.strip().lower()
+    if normalized == "jpg":
+        normalized = "jpeg"
+    if normalized not in {"png", "jpeg", "webp"}:
+        raise ValueError("output_format must be one of: png, jpeg, webp")
+    return normalized
+
+
+def normalize_image_compression(output_format, output_compression):
+    """规范化 JPEG/WebP 压缩质量；PNG 不需要该参数。"""
+    if output_format == "png":
+        return None
+    if output_compression is None or output_compression == "":
+        return 80
+    try:
+        value = int(output_compression)
+    except (TypeError, ValueError):
+        raise ValueError("output_compression must be an integer between 0 and 100")
+    if not 0 <= value <= 100:
+        raise ValueError("output_compression must be an integer between 0 and 100")
+    return value
+
+
+def normalize_image_background(background):
+    """规范化图片背景参数。"""
+    if not background:
+        return None
+    if not isinstance(background, str):
+        raise ValueError("background must be a string")
+    normalized = background.strip().lower()
+    if normalized not in {"auto", "opaque", "transparent"}:
+        raise ValueError("background must be one of: auto, opaque, transparent")
+    return normalized
+
+
+def normalize_image_count(count):
+    """校验图片生成数量。"""
+    if count is None or count == "":
+        return 1
+    try:
+        value = int(count)
+    except (TypeError, ValueError):
+        raise ValueError("n must be an integer")
+    if not 1 <= value <= 10:
+        raise ValueError("n must be between 1 and 10")
+    return value
+
+
+def to_absolute_image_url(image_url):
+    """把上游返回的相对图片路径补全为可访问 URL。"""
+    if not isinstance(image_url, str) or not image_url:
+        return image_url
+    if image_url.startswith("http://") or image_url.startswith("https://"):
+        return image_url
+    return f"{GENAI_IMAGE_STATIC_URL}{image_url.lstrip('/')}"
+
+
+def collect_image_reference_payload(image_base64_list):
+    """构造上游参考图字段；单张与多张使用不同字段名。"""
+    if not image_base64_list:
+        return {"imageBase64": None, "imageBase64List": None}
+    if len(image_base64_list) == 1:
+        return {"imageBase64": image_base64_list[0], "imageBase64List": None}
+    return {"imageBase64": None, "imageBase64List": image_base64_list}
+
+
+def call_genai_image_generation(
+    prompt,
+    spec,
+    count=1,
+    size="1024x1024",
+    quality="auto",
+    style="vivid",
+    output_format="png",
+    output_compression=None,
+    background=None,
+    image_base64_list=None,
+    access_token=None,
+):
+    """调用上游图片生成接口并返回原始 JSON。
+
+    Args:
+        prompt (str): 图片描述。
+        spec (dict): `resolve_image_model` 返回的模型规格。
+        count (int): 生成张数。
+        size (str): `宽x高`。
+        quality (str): low/medium/high/auto。
+        style (str): vivid/natural。
+        output_format (str): png/jpeg/webp。
+        output_compression (int | None): JPEG/WebP 压缩质量。
+        image_base64_list (list[str] | None): 参考图 base64（不含 data URL 前缀）。
+        access_token (str | None): 请求级 GenAI token。
+
+    Returns:
+        dict: 上游图片生成响应。
+
+    Raises:
+        RuntimeError: 上游返回业务错误或格式异常。
+    """
+    payload = {
+        "chatInfo": prompt,
+        "type": "3",
+        "aiType": spec["request_id"],
+        "aiSecType": "1",
+        "chatGroupId": uuid.uuid4().hex,
+        "size": size,
+        "quality": quality,
+        "count": count,
+        "style": style,
+        "outputFormat": output_format,
+        "outputCompression": output_compression,
+        "rootAiType": spec["root_ai_type"],
+    }
+    if background:
+        payload["background"] = background
+    payload.update(collect_image_reference_payload(image_base64_list))
+
+    logger.debug(
+        "Upstream image request prepared: model=%s size=%s quality=%s count=%s refs=%s",
+        spec["request_id"],
+        size,
+        quality,
+        count,
+        len(image_base64_list or []),
+    )
+    response = requests.post(
+        GENAI_URL,
+        headers=build_genai_headers(access_token),
+        json=payload,
+        timeout=UPSTREAM_TIMEOUT,
+    )
+    response.raise_for_status()
+    try:
+        result = response.json()
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GenAI image API returned a non-JSON response") from exc
+
+    if result.get("success") is False or result.get("code") not in (None, 200, "200"):
+        message = result.get("errMsg") or result.get("message") or result
+        raise RuntimeError(f"GenAI image API error: {message}")
+    if not isinstance(result.get("data"), list) or not result["data"]:
+        raise RuntimeError(f"GenAI image API returned no image data: {result}")
+    return result
+
+
+def build_openai_image_response(result, prompt, response_format="url"):
+    """把上游图片响应转换为 OpenAI Images API 兼容结构。
+
+    Args:
+        result (dict): `call_genai_image_generation` 返回的原始响应。
+        prompt (str): 原始提示词。
+        response_format (str): `url` 或 `b64_json`。
+
+    Returns:
+        dict: OpenAI Images API 兼容响应。
+    """
+    data = []
+    for item in result["data"]:
+        image_url = None
+        if isinstance(item, dict):
+            image_url = item.get("url") or item.get("imageUrl")
+        if image_url:
+            image_url = to_absolute_image_url(image_url)
+
+        if response_format == "b64_json":
+            encoded = None
+            if isinstance(item, dict):
+                encoded = item.get("b64_json")
+            if not encoded and image_url:
+                encoded = base64.b64encode(fetch_image_bytes(image_url)[0]).decode()
+            if encoded:
+                data.append({"b64_json": encoded})
+                continue
+        if image_url:
+            data.append({"url": image_url})
+
+    if not data:
+        raise RuntimeError("GenAI image API response contained no usable image URL")
+
+    payload = {
+        "created": result.get("created") or int(datetime.now().timestamp()),
+        "data": data,
+    }
+    for key in ("background", "output_format", "quality", "size"):
+        if key in result:
+            payload[key] = result[key]
+    if isinstance(result.get("usage"), dict):
+        payload["usage"] = result["usage"]
+    return payload
 
 
 def convert_messages_to_genai_format(messages):
@@ -2148,7 +2428,7 @@ def chat_completions():
             return jsonify({'error': 'Missing messages field'}), 400
         
         messages = req_data.get('messages', [])
-        model = req_data.get('model', 'gpt-3.5-turbo')
+        model = req_data.get('model', 'gpt-6.1-sol')
         stream = req_data.get('stream', False)
         max_tokens = req_data.get('max_tokens', req_data.get('max_completion_tokens', 30000))
         tools = get_request_tools(req_data)
@@ -2159,6 +2439,11 @@ def chat_completions():
         if retired_ai_type:
             logger.warning("Rejecting request for retired model: %s", model)
             return jsonify({'error': f"Model '{model}' (upstream aiType '{retired_ai_type}') is no longer available on the GenAI platform"}), 400
+
+        if is_image_generation_model(model):
+            return jsonify({
+                'error': f"Model '{model}' is an image-generation model; use /v1/images/generations instead"
+            }), 400
 
         image_payload = prepare_image_payload(messages, model, access_token)
         
@@ -2226,7 +2511,7 @@ def responses():
         if not req_data or 'input' not in req_data:
             return jsonify({'error': 'Missing input field'}), 400
 
-        model = req_data.get('model', 'gpt-4.1')
+        model = req_data.get('model', 'gpt-6.1-sol')
         stream = req_data.get('stream', False)
         max_output_tokens = req_data.get('max_output_tokens', req_data.get('max_tokens', 30000))
         messages = build_response_input_messages(req_data.get('input'))
@@ -2239,6 +2524,11 @@ def responses():
         if retired_ai_type:
             logger.warning("Rejecting request for retired model: %s", model)
             return jsonify({'error': f"Model '{model}' (upstream aiType '{retired_ai_type}') is no longer available on the GenAI platform"}), 400
+
+        if is_image_generation_model(model):
+            return jsonify({
+                'error': f"Model '{model}' is an image-generation model; use /v1/images/generations instead"
+            }), 400
 
         if not messages:
             return jsonify({'error': 'No input message found'}), 400
@@ -2333,6 +2623,118 @@ def responses():
     except Exception as e:
         logger.exception("responses failed")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/v1/images/generations', methods=['POST'])
+def image_generations():
+    """处理 OpenAI Images API 兼容的文生图请求。
+
+    Returns:
+        Response: OpenAI Images API 兼容 JSON 响应。
+    """
+    try:
+        req_data = request.get_json(silent=True) or {}
+        prompt = req_data.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return jsonify({'error': 'Missing prompt field'}), 400
+
+        spec = resolve_image_model(req_data.get("model"))
+        response_format = req_data.get("response_format") or "url"
+        if response_format not in {"url", "b64_json"}:
+            return jsonify({'error': "response_format must be 'url' or 'b64_json'"}), 400
+
+        output_format = normalize_image_format(req_data.get("output_format"))
+        result = call_genai_image_generation(
+            prompt=prompt,
+            spec=spec,
+            count=normalize_image_count(req_data.get("n")),
+            size=normalize_image_size(req_data.get("size")),
+            quality=normalize_image_quality(req_data.get("quality")),
+            style=normalize_image_style(req_data.get("style")),
+            output_format=output_format,
+            output_compression=normalize_image_compression(
+                output_format, req_data.get("output_compression")
+            ),
+            background=normalize_image_background(req_data.get("background")),
+            access_token=get_request_access_token(),
+        )
+        return jsonify(build_openai_image_response(result, prompt, response_format))
+
+    except ValueError as exc:
+        logger.warning("image_generations rejected: %s", exc)
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        logger.exception("image_generations failed")
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/v1/images/edits', methods=['POST'])
+def image_edits():
+    """处理 OpenAI Images API 兼容的参考图/图片编辑请求。
+
+    上游没有独立的 mask 概念，`mask` 字段会被忽略，参考图统一以
+    `imageBase64` / `imageBase64List` 透传。
+
+    Returns:
+        Response: OpenAI Images API 兼容 JSON 响应。
+    """
+    try:
+        prompt = request.form.get("prompt")
+        if not prompt or not prompt.strip():
+            return jsonify({'error': 'Missing prompt field'}), 400
+
+        files = request.files.getlist("image") or request.files.getlist("image[]")
+        if not files:
+            return jsonify({'error': 'Missing image file'}), 400
+        if len(files) > IMAGE_MAX_REFERENCE_IMAGES:
+            return jsonify({
+                'error': f'At most {IMAGE_MAX_REFERENCE_IMAGES} reference images are supported'
+            }), 400
+        if request.files.get("mask"):
+            logger.warning("image_edits received a mask; upstream has no mask support, ignoring it")
+
+        image_base64_list = []
+        total_size = 0
+        for uploaded in files:
+            file_bytes = uploaded.read()
+            if not file_bytes:
+                return jsonify({'error': 'Uploaded image is empty'}), 400
+            total_size += len(file_bytes)
+            if len(file_bytes) > 10 * 1024 * 1024:
+                return jsonify({'error': 'Each image must be 10MB or smaller'}), 400
+            if total_size > 25 * 1024 * 1024:
+                return jsonify({'error': 'Total image size must be 25MB or smaller'}), 400
+            image_base64_list.append(base64.b64encode(file_bytes).decode())
+
+        spec = resolve_image_model(request.form.get("model"))
+        response_format = request.form.get("response_format") or "url"
+        if response_format not in {"url", "b64_json"}:
+            return jsonify({'error': "response_format must be 'url' or 'b64_json'"}), 400
+
+        output_format = normalize_image_format(request.form.get("output_format"))
+        result = call_genai_image_generation(
+            prompt=prompt,
+            spec=spec,
+            count=normalize_image_count(request.form.get("n")),
+            size=normalize_image_size(request.form.get("size")),
+            quality=normalize_image_quality(request.form.get("quality")),
+            style=normalize_image_style(request.form.get("style")),
+            output_format=output_format,
+            output_compression=normalize_image_compression(
+                output_format, request.form.get("output_compression")
+            ),
+            background=normalize_image_background(request.form.get("background")),
+            image_base64_list=image_base64_list,
+            access_token=get_request_access_token(),
+        )
+        return jsonify(build_openai_image_response(result, prompt, response_format))
+
+    except ValueError as exc:
+        logger.warning("image_edits rejected: %s", exc)
+        return jsonify({'error': str(exc)}), 400
+    except Exception as exc:
+        logger.exception("image_edits failed")
+        return jsonify({'error': str(exc)}), 500
+
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
