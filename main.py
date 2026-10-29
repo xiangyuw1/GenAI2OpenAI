@@ -620,12 +620,6 @@ def infer_root_ai_type(model_name):
     return "azure" if normalized.startswith(azure_markers) else "xinference"
 
 
-def is_gpt_model(model_name):
-    """判断模型是否为 GPT/Azure 系列（图片能力仅对其开放）。"""
-    _, root_ai_type = resolve_model(model_name)
-    return root_ai_type == "azure"
-
-
 def guess_filename_from_url(image_url):
     """从 URL 推断文件名。"""
     path = urlparse(image_url).path
@@ -732,7 +726,11 @@ def parse_image_input_from_message(message):
 
 
 def prepare_image_payload(messages, model, access_token=None):
-    """从请求消息中准备上游所需图片参数（仅 GPT 模型可用）。"""
+    """从请求消息中准备上游所需图片参数。
+
+    上游对所有文本模型统一接受 `imageUrl` / `width` / `height`，不再只限于
+    GPT/Azure 路由；是否真正支持图片由具体模型决定。
+    """
     image_input = None
     for message in reversed(messages):
         image_input = parse_image_input_from_message(message)
@@ -743,9 +741,7 @@ def prepare_image_payload(messages, model, access_token=None):
         logger.debug("No image input found in messages")
         return None
 
-    if not is_gpt_model(model):
-        logger.debug("Rejecting image input for non-GPT model: %s", model)
-        raise ValueError("Image input is only available for GPT models")
+    logger.debug("Preparing image payload for model: %s", model)
 
     if image_input.startswith("data:"):
         image_bytes, mime_type, filename = read_image_from_data_url(image_input)

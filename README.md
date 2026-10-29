@@ -206,7 +206,7 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 - 在支持原生工具历史的模型上（实测 `deepseek-v4.1-flash`、`deepseek-chat`、`qwen-3.8`、`glm-5.3-flash`），历史消息中的 `assistant.tool_calls` 与 `role=tool` 会原样透传给上游，不再拍平成用户文本；`kimi-k3`、`minimax` 与 Azure GPT 系列仍使用旧的文本降级逻辑；
 - 原生工具历史末条为工具结果时，代理会自动追加一条继续指令，因为上游始终会在 `messages` 后追加一条 `chatInfo` 用户消息。
 
-### 图片输入（仅 GPT 模型）
+### 图片输入
 
 `/v1/chat/completions` 支持 OpenAI 常见多模态消息格式：
 
@@ -220,10 +220,11 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 2. 自动调用 GenAI 图片上传接口 `https://genaipic.shanghaitech.edu.cn//sys/common/upload`。
 3. 将返回的 `imageUrl`、`width`、`height` 透传到上游对话请求。
 
-限制：
+说明：
 
-- 图片能力仅对 GPT/Azure 路由模型开放（如 `gpt-6.1-sol`、`gpt-6-astra`、`gpt-6-luna`）。
-- 若对非 GPT 模型传图，请求会返回错误：`Image input is only available for GPT models`。
+- 图片不再只对 GPT/Azure 路由开放；上游统一接受 `imageUrl`、`width`、`height`，是否真正识别图片由具体模型决定。
+- 已实测 `deepseek-v4.1-flash`、`deepseek-chat`、`qwen-3.8`、`glm-5.3-flash`、`kimi-k3` 可以识别图片。
+- 不支持图片的模型可能返回空内容或上游错误。
 
 示例：
 
@@ -232,7 +233,7 @@ curl http://127.0.0.1:5000/v1/chat/completions \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-6.1-sol",
+    "model": "deepseek-v4.1-flash",
     "messages": [
       {
         "role": "user",
