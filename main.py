@@ -323,6 +323,24 @@ RETIRED_MODEL_ALIASES = {
     "gpt-image-1.5": "gpt-image-1.5",
 }
 
+# 上游只有部分模型会真正消费原生的 tool / assistant.tool_calls 历史。
+# 实测（2026-10-29）deepseek-pro、deepseek-chat、qwen-instruct、chatglm 可以
+# 正确处理 role=tool 与 assistant.tool_calls；Kimi-k3、MiniMax-M1 和 Azure GPT
+# 系列会返回空内容，因此这些模型继续沿用旧的文本降级逻辑。
+NATIVE_TOOL_HISTORY_AI_TYPES = {
+    "chatglm",
+    "qwen-instruct",
+    "deepseek-pro",
+    "deepseek-chat",
+}
+
+# 原生 tool 历史末条是工具结果时，上游仍会追加一条 user 消息。
+# 用一条简短的继续指令触发下一轮回答，避免把工具结果重复拍平成 user 文本。
+TOOL_CONTINUATION_PROMPT = (
+    "以上是工具执行结果。请基于结果继续完成用户请求；"
+    "如需调用工具，请按可用工具的调用格式继续请求。"
+)
+
 
 def build_model_alias_lookup():
     """构建模型别名查找表。
@@ -377,6 +395,24 @@ def resolve_model(model_name):
     if spec is None:
         return model_name, infer_root_ai_type(model_name)
     return spec["request_id"], spec["root_ai_type"]
+
+
+def supports_native_tool_history(model_name):
+    """判断模型是否支持上游原生的 tool 消息历史。
+
+    该判断只影响历史消息的编码方式，不改变本地提示词工具层：工具定义仍然
+    通过 system prompt 传递，因为上游不接受顶层 `tools` 字段。
+
+    Args:
+        model_name (Any): 调用方传入的模型名。
+
+    Returns:
+        bool: 支持原生 `role=tool` / `assistant.tool_calls` 历史时返回 `True`。
+    """
+    upstream_model, _ = resolve_model(model_name)
+    if not isinstance(upstream_model, str):
+        return False
+    return upstream_model.lower() in NATIVE_TOOL_HISTORY_AI_TYPES
 
 
 def extract_bearer_key():
@@ -1028,6 +1064,15 @@ def convert_messages_to_genai_format(messages):
         if msg.get("role") == "user":
             chat_info = msg.get("content", "")
             break
+
+    # 原生工具调用历史可能没有 user 消息，此时仍应允许请求继续，
+    # 由 split_messages_for_genai 追加继续指令。
+    if not chat_info and any(
+        msg.get("role") in ("tool", "function")
+        or (msg.get("role") == "assistant" and msg.get("tool_calls"))
+        for msg in messages
+    ):
+        return TOOL_CONTINUATION_PROMPT
     
     return chat_info
 
@@ -1052,8 +1097,17 @@ def split_messages_for_genai(messages):
         return [], ""
 
     # 常规情况：末条即 user 消息，移出后可被上游原样追加回去，语义无损。
-    if messages[-1].get("role") == "user" and messages[-1].get("content"):
-        return list(messages[:-1]), messages[-1]["content"]
+    last_message = messages[-1]
+
+    if last_message.get("role") == "user" and last_message.get("content"):
+        return list(messages[:-1]), last_message["content"]
+
+    # 原生工具调用历史：末条是工具结果，或等待模型继续的 assistant.tool_calls。
+    # 上游会无条件追加一条 user 消息，这里用继续指令触发下一轮回答。
+    if last_message.get("role") in ("tool", "function") or (
+        last_message.get("role") == "assistant" and last_message.get("tool_calls")
+    ):
+        return list(messages), TOOL_CONTINUATION_PROMPT
 
     # 末条非 user（如 assistant 预填充）时无法无损还原顺序，
     # 退化为保留全部消息并重述最后一条 user 内容，避免 chatInfo 为空。
@@ -1083,8 +1137,52 @@ def normalize_content_for_genai(content):
     return str(content)
 
 
-def normalize_messages_for_genai(messages):
-    """把 OpenAI tool messages 降级为普通文本，避免上游无法理解原生工具结构。"""
+def normalize_tool_calls_for_genai(tool_calls):
+    """把历史消息里的 tool_calls 归一化为上游可接受的结构。
+
+    Args:
+        tool_calls (Any): OpenAI 风格的 `tool_calls` 列表。
+
+    Returns:
+        list[dict]: 每项包含 `id`、`type` 与 `function` 字段；无法识别的项会被丢弃。
+    """
+    normalized_calls = []
+    for index, call in enumerate(tool_calls or []):
+        if not isinstance(call, dict):
+            continue
+
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = function.get("name") or call.get("name")
+        if not name:
+            continue
+
+        arguments = function.get("arguments", call.get("arguments", {}))
+        normalized_calls.append({
+            "id": call.get("id") or f"call_{uuid.uuid4().hex[:24]}_{index}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": normalize_tool_call_arguments(arguments),
+            },
+        })
+
+    return normalized_calls
+
+
+def normalize_messages_for_genai(messages, native_tool_history=False):
+    """把历史消息归一化为上游可读结构。
+
+    `native_tool_history=True` 时保留上游已支持的 `role=tool` 与
+    `assistant.tool_calls`，避免把工具结果拍平成普通用户文本；模型不支持时
+    仍回退到旧的文本降级逻辑。
+
+    Args:
+        messages (list[dict]): OpenAI 风格的消息列表。
+        native_tool_history (bool): 是否使用原生工具消息历史。
+
+    Returns:
+        list[dict]: 可直接发送给上游的消息列表。
+    """
     normalized_messages = []
     for message in messages:
         if not isinstance(message, dict):
@@ -1093,21 +1191,61 @@ def normalize_messages_for_genai(messages):
         role = message.get("role", "user")
         content = normalize_content_for_genai(message.get("content"))
 
-        if role == "tool":
-            tool_name = message.get("name") or message.get("tool_call_id") or "tool"
-            normalized_messages.append({
-                "role": "user",
-                "content": f"工具 {tool_name} 返回结果：\n{content}",
-            })
+        if role in ("tool", "function"):
+            if native_tool_history:
+                tool_name = message.get("name")
+                # 旧版 function 消息没有 tool_call_id，用 name 生成与
+                # assistant.function_call 相同的 id，保证历史能配对。
+                legacy_call_id = f"call_{tool_name}" if tool_name else None
+                tool_message = {
+                    "role": "tool",
+                    "content": content,
+                    "tool_call_id": message.get("tool_call_id") or legacy_call_id or "tool",
+                }
+                if tool_name:
+                    tool_message["name"] = tool_name
+                normalized_messages.append(tool_message)
+            else:
+                tool_name = message.get("name") or message.get("tool_call_id") or "tool"
+                normalized_messages.append({
+                    "role": "user",
+                    "content": f"工具 {tool_name} 返回结果：\n{content}",
+                })
             continue
 
-        tool_calls = message.get("tool_calls")
-        if role == "assistant" and tool_calls and not content:
-            normalized_messages.append({
-                "role": "assistant",
-                "content": "已请求调用工具：\n" + json.dumps(tool_calls, ensure_ascii=False),
-            })
-            continue
+        if role == "assistant":
+            tool_calls = message.get("tool_calls")
+            legacy_function_call = message.get("function_call")
+            if native_tool_history:
+                if not tool_calls and isinstance(legacy_function_call, dict):
+                    legacy_name = legacy_function_call.get("name")
+                    tool_calls = [{
+                        "id": (
+                            message.get("tool_call_id")
+                            or (f"call_{legacy_name}" if legacy_name else f"call_{uuid.uuid4().hex[:24]}")
+                        ),
+                        "type": "function",
+                        "function": legacy_function_call,
+                    }]
+
+                normalized_calls = normalize_tool_calls_for_genai(tool_calls)
+                if normalized_calls:
+                    normalized_messages.append({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": normalized_calls,
+                    })
+                    continue
+            elif tool_calls:
+                call_description = "已请求调用工具：\n" + json.dumps(
+                    tool_calls,
+                    ensure_ascii=False,
+                )
+                normalized_messages.append({
+                    "role": "assistant",
+                    "content": f"{content}\n\n{call_description}" if content else call_description,
+                })
+                continue
 
         normalized_messages.append({
             "role": role,
@@ -1707,12 +1845,40 @@ def collect_genai_response(messages, model, max_tokens, access_token=None, image
     }
 
 
+def normalize_responses_tool_output(output):
+    """把 Responses API 的 `function_call_output.output` 归一化为文本。
+
+    Args:
+        output (Any): 字符串、内容片段数组或其他可 JSON 序列化的值。
+
+    Returns:
+        str: 可直接放入 tool 消息的文本。
+    """
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        text_parts = []
+        for part in output:
+            if isinstance(part, dict):
+                text = part.get("text") or part.get("output_text")
+                if text:
+                    text_parts.append(text)
+            elif isinstance(part, str):
+                text_parts.append(part)
+        if text_parts:
+            return "\n".join(text_parts)
+    return json.dumps(output, ensure_ascii=False)
+
+
 def build_response_input_messages(input_value):
     """将 Responses API 输入归一化为消息列表。
 
     除普通文本外，还需处理 agent 场景下的历史工具调用与工具结果：
-    `function_call` 与 `function_call_output` 是独立的 input item（不带 role），
-    若直接丢弃，模型就看不到上一轮工具的执行结果，会重复请求同一个工具。
+    `function_call` 与 `function_call_output` 是独立的 input item（不带 role）。
+    这里先保留为原生 `assistant.tool_calls` / `role=tool` 结构，后续由
+    `normalize_messages_for_genai` 根据模型能力决定是否降级为文本。
 
     Args:
         input_value (str | list | Any): `/v1/responses` 的 `input` 字段。
@@ -1731,28 +1897,49 @@ def build_response_input_messages(input_value):
 
             item_type = item.get("type")
 
-            # 助手上一轮发起的工具调用，转述为文本让上游理解对话历史。
+            # 助手上一轮发起的工具调用，保留为原生 tool_calls。
             if item_type == "function_call":
-                call_desc = json.dumps({
-                    "name": item.get("name"),
-                    "arguments": item.get("arguments"),
-                }, ensure_ascii=False)
-                messages.append({
-                    "role": "assistant",
-                    "content": f"已请求调用工具：\n{call_desc}",
-                })
+                name = item.get("name")
+                if not name:
+                    continue
+
+                tool_call = {
+                    "id": item.get("call_id") or f"call_{uuid.uuid4().hex[:24]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": normalize_tool_call_arguments(item.get("arguments")),
+                    },
+                }
+
+                # 连续的 function_call 属于同一次并行工具调用，合并到同一条
+                # assistant 消息，保持与 OpenAI 原生结构一致。
+                if (
+                    messages
+                    and messages[-1].get("role") == "assistant"
+                    and messages[-1].get("tool_calls")
+                    and not messages[-1].get("content")
+                ):
+                    messages[-1]["tool_calls"].append(tool_call)
+                else:
+                    messages.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [tool_call],
+                    })
                 continue
 
             # 工具执行结果，必须回灌给模型，否则它无法基于结果继续推进。
             if item_type == "function_call_output":
-                output = item.get("output")
-                if not isinstance(output, str):
-                    output = json.dumps(output, ensure_ascii=False)
-                tool_name = item.get("name") or item.get("call_id") or "tool"
-                messages.append({
-                    "role": "user",
-                    "content": f"工具 {tool_name} 返回结果：\n{output}",
-                })
+                output = normalize_responses_tool_output(item.get("output"))
+                tool_message = {
+                    "role": "tool",
+                    "content": output,
+                    "tool_call_id": item.get("call_id") or item.get("name") or "tool",
+                }
+                if item.get("name"):
+                    tool_message["name"] = item["name"]
+                messages.append(tool_message)
                 continue
 
             role = item.get("role", "user")
@@ -2454,7 +2641,10 @@ def chat_completions():
             return jsonify({'error': 'No user message found'}), 400
 
         tools_enabled = should_enable_tools(tools, tool_choice)
-        upstream_messages = normalize_messages_for_genai(messages)
+        upstream_messages = normalize_messages_for_genai(
+            messages,
+            native_tool_history=supports_native_tool_history(model),
+        )
         if tools_enabled:
             upstream_messages = build_tool_calling_messages(upstream_messages, tools, tool_choice)
 
@@ -2539,7 +2729,10 @@ def responses():
             messages = [{"role": "system", "content": instructions}] + messages
 
         tools_enabled = should_enable_tools(tools, tool_choice)
-        upstream_messages = normalize_messages_for_genai(messages)
+        upstream_messages = normalize_messages_for_genai(
+            messages,
+            native_tool_history=supports_native_tool_history(model),
+        )
         if tools_enabled:
             upstream_messages = build_tool_calling_messages(upstream_messages, tools, tool_choice)
 

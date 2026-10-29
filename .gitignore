@@ -209,6 +209,10 @@ cython_debug/
 .genai_token_cache
 .genai_token_cache.*
 
+# 上游账号密码（学号@密码），禁止提交
+.genai_account
+.genai_account.*
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

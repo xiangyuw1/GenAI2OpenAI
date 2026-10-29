@@ -18,7 +18,7 @@ GenAI 是一个基于 Flask 的聊天机器人接口服务，兼容 OpenAI 的�
 | 流式输出（SSE）                           | ✅              | ✅             | 支持 Chat Completions 与 Responses 两条链路                |
 | 非流式输出                                | ✅              | ✅             | 统一聚合上游增量后返回标准 JSON                            |
 | 推理内容字段（reasoning）                 | 部分模型支持    | ✅ 兼容输出    | 通过 `reasoning_content` / `response.reasoning.delta` 暴露 |
-| Tool Calling（`tools/tool_choice`）       | ✅ 原生         | ✅ 提示词兼容  | 上游无原生工具调用，本项目做 JSON 约定与本地解析           |
+| Tool Calling（`tools/tool_choice`）       | ✅ 原生         | ✅ 提示词兼容  | 上游不接受顶层 `tools`，工具定义仍用提示词传递；deepseek / qwen / glm 等模型的历史工具消息已改为原生 `role=tool` / `assistant.tool_calls` |
 | 旧版函数调用（`functions/function_call`） | 已逐步废弃      | ✅ 兼容        | 自动转换为 `tools/tool_choice` 语义                        |
 | 图片输入（Vision）                        | ✅              | ✅（GPT 模型） | 服务端自动上传图片并注入 `imageUrl/width/height`           |
 | `POST /v1/images/generations`             | ✅ 原生支持     | ✅ 已兼容      | 文生图，支持 URL / base64 返回与 n/size/quality/style      |
@@ -170,7 +170,7 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 
 ### 工具调用兼容
 
-上游 GenAI API 没有原生 tool calling 能力。本项目在 Chat Completions 接口中通过系统提示词要求模型输出工具调用 JSON，并在本地解析为 OpenAI 兼容的 `tool_calls`：
+上游 GenAI API 不接受顶层 `tools` 字段，因此工具定义仍通过系统提示词传递；模型输出的工具调用 JSON 会在本地解析为 OpenAI 兼容的 `tool_calls`：
 
 ```json
 {
@@ -202,7 +202,9 @@ uv run tools/skills/context_length_tester/context_length_tester.py --model deeps
 
 - 解析优先级为 **JSON 优先**；
 - 同时兼容 XML 标签形式的工具调用块：`<tool_call>{"name":"...","arguments":{...}}</tool_call>`；
-- 当模型输出多个 `<tool_call>...</tool_call>` 块时，会按顺序解析为多个 `tool_calls`。
+- 当模型输出多个 `<tool_call>...</tool_call>` 块时，会按顺序解析为多个 `tool_calls`；
+- 在支持原生工具历史的模型上（实测 `deepseek-v4.1-flash`、`deepseek-chat`、`qwen-3.8`、`glm-5.3-flash`），历史消息中的 `assistant.tool_calls` 与 `role=tool` 会原样透传给上游，不再拍平成用户文本；`kimi-k3`、`minimax` 与 Azure GPT 系列仍使用旧的文本降级逻辑；
+- 原生工具历史末条为工具结果时，代理会自动追加一条继续指令，因为上游始终会在 `messages` 后追加一条 `chatInfo` 用户消息。
 
 ### 图片输入（仅 GPT 模型）
 
